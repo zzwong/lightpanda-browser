@@ -1172,9 +1172,11 @@ pub fn focusForMouseDown(frame: *Frame, target: *Element) !void {
         }
     }
 
-    const doc = target.asNode().ownerDocument(frame) orelse frame.document;
-    if (doc._active_element) |active| {
-        try active.blur(frame);
+    const owner = target.ownerFrame(frame) orelse return;
+    try Element.focusFrameAncestors(owner);
+    if (owner.window._closed) return;
+    if (owner.document._active_element) |active| {
+        try active.blur(owner);
     }
 }
 
@@ -2397,4 +2399,149 @@ test "user_input: mouse hover transitions cross nested iframe documents" {
         \\events.find(e => e.where === 'outer' && e.type === 'pointerover').x === document.getElementById('outer').getBoundingClientRect().x + 1 &&
         \\events.find(e => e.where === 'outer' && e.type === 'pointerover').y === document.getElementById('outer').getBoundingClientRect().y + 1
     , null)).isTrue());
+}
+
+test "user_input: mouse blank iframe takes document focus" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const outer = main.document.getElementById("outer", main).?;
+    var ls: js.Local.Scope = undefined;
+    child.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("document.body.replaceChildren();", null);
+    try outer.focus(main);
+    const rect = child.iframe.?.asElement().boundingClientRectValues(main);
+    try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    if (main.document._active_element != child.iframe.?.asElement()) {
+        std.debug.print("blank iframe focus: parent still focuses outer={}, keyboard routes to main={}\n", .{
+            main.document._active_element == outer,
+            focusedFrame(main) == main,
+        });
+    }
+    try testing.expect(main.document._active_element == child.iframe.?.asElement());
+    try testing.expect(focusedFrame(main) == child);
+    try insertText(focusedFrame(main), "wrong-document");
+    var outer_scope: js.Local.Scope = undefined;
+    main.js.localScope(&outer_scope);
+    defer outer_scope.deinit();
+    try testing.expect((try outer_scope.local.compileAndRun("document.getElementById('outer').value === ''", null)).isTrue());
+}
+
+test "user_input: mouse static nested iframe takes document focus" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const nested = child.child_frames.items[0];
+    var ls: js.Local.Scope = undefined;
+    nested.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("document.body.innerHTML = '<div style=width:150px;height:150px>static</div>';", null);
+    try main.document.getElementById("outer", main).?.focus(main);
+    const child_rect = child.iframe.?.asElement().boundingClientRectValues(main);
+    const nested_rect = nested.iframe.?.asElement().boundingClientRectValues(child);
+    const x = child_rect.x + nested_rect.x + 10;
+    const y = child_rect.y + nested_rect.y + 10;
+    try triggerMousePress(main, x, y, mouse_button.main, 1);
+    try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+    try testing.expect(main.document._active_element == child.iframe.?.asElement());
+    try testing.expect(child.document._active_element == nested.iframe.?.asElement());
+    try testing.expect(focusedFrame(main) == nested);
+}
+
+test "user_input: mouse blank iframe cancelled press preserves focus" {
+    for ([_][]const u8{ "pointerdown", "mousedown" }) |event| {
+        const page = try testing.pageTest("input_mouse_frames.html", .{});
+        defer page.close();
+        const main = page.frame().?;
+        const child = main.child_frames.items[0];
+        const outer = main.document.getElementById("outer", main).?;
+        var ls: js.Local.Scope = undefined;
+        child.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.compileAndRun("document.body.replaceChildren();", null);
+        const script = try std.fmt.allocPrint(testing.allocator, "document.addEventListener('{s}', e => e.preventDefault());", .{event});
+        defer testing.allocator.free(script);
+        _ = try ls.local.compileAndRun(script, null);
+        try outer.focus(main);
+        const rect = child.iframe.?.asElement().boundingClientRectValues(main);
+        try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try testing.expect(main.document._active_element == outer);
+        try testing.expect(focusedFrame(main) == main);
+    }
+}
+
+test "user_input: mouse removed blank iframe does not take focus" {
+    for ([_][]const u8{ "pointerdown", "mousedown" }) |event| {
+        const page = try testing.pageTest("input_mouse_frames.html", .{});
+        defer page.close();
+        const main = page.frame().?;
+        const child = main.child_frames.items[0];
+        const outer = main.document.getElementById("outer", main).?;
+        var ls: js.Local.Scope = undefined;
+        main.js.localScope(&ls);
+        defer ls.deinit();
+        const script = try std.fmt.allocPrint(testing.allocator,
+            \\const iframe = document.getElementById('child');
+            \\iframe.contentDocument.body.replaceChildren();
+            \\iframe.contentDocument.addEventListener('{s}', () => iframe.remove());
+        , .{event});
+        defer testing.allocator.free(script);
+        _ = try ls.local.compileAndRun(script, null);
+        try outer.focus(main);
+        const rect = child.iframe.?.asElement().boundingClientRectValues(main);
+        try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try testing.expect(child.window._closed);
+        try testing.expect(main.document._active_element == outer);
+        try testing.expect(focusedFrame(main) == main);
+        try testing.expect(main.page.input_pointer.down_target == null);
+    }
+}
+
+test "user_input: mouse blank sibling iframe clears old focus chain" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const sibling = main.child_frames.items[1];
+    const middle = child.document.getElementById("middle", child).?;
+    var ls: js.Local.Scope = undefined;
+    main.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun(
+        \\window.events = [];
+        \\document.getElementById('child').contentDocument.getElementById('middle').addEventListener('blur', () => events.push('blur'));
+        \\for (const iframe of document.querySelectorAll('iframe')) {
+        \\  for (const type of ['focus', 'focusin', 'blur', 'focusout']) iframe.addEventListener(type, () => events.push('iframe-' + type));
+        \\}
+    , null);
+    try middle.focus(child);
+    const rect = sibling.iframe.?.asElement().boundingClientRectValues(main);
+    try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try testing.expect(main.document._active_element == sibling.iframe.?.asElement());
+    try testing.expect(child.document._active_element == null);
+    try testing.expect(focusedFrame(main) == sibling);
+    try insertText(focusedFrame(main), "wrong-document");
+    try testing.expect((try ls.local.compileAndRun(
+        \\events.join(',') === 'blur' && document.getElementById('child').contentDocument.getElementById('middle').value === ''
+    , null)).isTrue());
+}
+
+test "user_input: synthetic blank iframe click preserves focus" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const outer = main.document.getElementById("outer", main).?;
+    try outer.focus(main);
+    var ls: js.Local.Scope = undefined;
+    main.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("document.getElementById('sibling').contentDocument.body.click();", null);
+    try testing.expect(main.document._active_element == outer);
+    try testing.expect(focusedFrame(main) == main);
 }
