@@ -637,7 +637,12 @@ pub fn triggerMousePress(frame: *Frame, x: f64, y: f64, button: i32, click_count
 }
 
 pub fn triggerMouseMove(frame: *Frame, x: f64, y: f64) !void {
-    const hit = (try mouseHitTest(frame, x, y)) orelse return;
+    if (frame.window._closed) return;
+    const hit = (try mouseHitTest(frame, x, y)) orelse {
+        // A miss ends hover without releasing a held button.
+        updateHoverTarget(frame, null, HoverContext{ .x = x, .y = y, .buttons = frame.page.input_pointer.held });
+        return;
+    };
     const target = hit.target;
     if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame mouse move", .{
@@ -2108,5 +2113,288 @@ test "user_input: mouse hit testing still enters a blank child document" {
     try testing.expect((try ls.local.compileAndRun(
         \\events.map(e => e.type).join(',') === 'pointerover,mouseover,pointermove,mousemove,pointerdown,mousedown,pointerup,mouseup,click' &&
         \\events.every(e => e.target === 'HTML' && e.x === 1 && e.y === 1)
+    , null)).isTrue());
+}
+
+test "user_input: excluded child roots clear hover without releasing held buttons" {
+    for ([_][]const u8{ "display: none", "pointer-events: none" }) |style| {
+        for ([_]bool{ false, true }) |from_child| {
+            const page = try testing.pageTest("input_mouse_frames.html", .{});
+            defer page.close();
+            const main = page.frame().?;
+            const child = main.child_frames.items[0];
+            const owner = if (from_child) child else main;
+            const target = owner.document.getElementById(if (from_child) "middle" else "outer", owner).?;
+            const rect = target.boundingClientRectValues(owner);
+            const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
+            const x = rect.x + (if (from_child) iframe_rect.x else @as(f64, 0)) + 1;
+            const y = rect.y + (if (from_child) iframe_rect.y else @as(f64, 0)) + 1;
+            var ls: js.Local.Scope = undefined;
+            owner.js.localScope(&ls);
+            defer ls.deinit();
+            _ = try ls.local.compileAndRun(
+                \\window.events = [];
+                \\const target = document.getElementById(window.parent === window ? 'outer' : 'middle');
+                \\for (const type of ['pointerover', 'mouseover', 'pointerenter', 'mouseenter', 'pointerout', 'mouseout', 'pointerleave', 'mouseleave']) {
+                \\  target.addEventListener(type, e => events.push({type, buttons:e.buttons, related:e.relatedTarget, trusted:e.isTrusted}));
+                \\}
+            , null);
+            try triggerMouseMove(main, x, y);
+            try triggerMousePress(main, x, y, mouse_button.main, 1);
+            try testing.expect(main.page.input_hover_target == target);
+            const root = child.document.getDocumentElement().?;
+            try root.setStyle(style, child);
+            try testing.expect((try child.document.elementFromPoint(1, 1, child)) == null);
+            try triggerMouseMove(main, iframe_rect.x + 1, iframe_rect.y + 1);
+            try testing.expect(main.page.input_hover_target == null);
+            try testing.expectEqual(1, main.page.input_pointer.held);
+            try testing.expect(main.page.input_pointer.down_target == target);
+            try root.setStyle("", child);
+            try triggerMouseMove(main, x, y);
+            try testing.expect(main.page.input_hover_target == target);
+            try testing.expect((try ls.local.compileAndRun(
+                \\events.map(e => e.type).join(',') === 'pointerover,mouseover,pointerenter,mouseenter,pointerout,mouseout,pointerleave,mouseleave,pointerover,mouseover,pointerenter,mouseenter' &&
+                \\events.every(e => e.related === null && e.trusted) &&
+                \\events.slice(0,4).every(e => e.buttons === 0) && events.slice(4).every(e => e.buttons === 1)
+            , null)).isTrue());
+            try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+            try testing.expectEqual(0, main.page.input_pointer.held);
+            try testing.expect(main.page.input_pointer.down_target == null);
+        }
+    }
+}
+
+test "user_input: removing a pressed iframe between messages clears pointer state" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const target = child.document.getElementById("middle", child).?;
+    const outer = main.document.getElementById("outer", main).?;
+    const target_rect = target.boundingClientRectValues(child);
+    const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
+    const outer_rect = outer.boundingClientRectValues(main);
+
+    var main_ls: js.Local.Scope = undefined;
+    main.js.localScope(&main_ls);
+    defer main_ls.deinit();
+    _ = try main_ls.local.compileAndRun(
+        \\window.events = [];
+        \\const outer = document.getElementById('outer');
+        \\for (const type of ['mousedown', 'mouseup', 'click']) {
+        \\  outer.addEventListener(type, () => events.push(type));
+        \\}
+    , null);
+
+    {
+        var child_ls: js.Local.Scope = undefined;
+        child.js.localScope(&child_ls);
+        defer child_ls.deinit();
+        _ = try child_ls.local.compileAndRun(
+            \\document.getElementById('middle').addEventListener('pointerdown', e => e.preventDefault());
+        , null);
+    }
+
+    try triggerMousePress(main, target_rect.x + iframe_rect.x + 1, target_rect.y + iframe_rect.y + 1, mouse_button.main, 1);
+    try testing.expect(main.page.input_pointer.down_target == target);
+    try testing.expectEqual(@as(u16, 1), main.page.input_pointer.held);
+    try testing.expect(main.page.input_pointer.mousedown_suppressed);
+
+    // Detach only after press returns so the later release exercises stored state.
+    _ = try main_ls.local.compileAndRun("document.getElementById('child').remove()", null);
+    try testing.expect(child.window._closed);
+    try testing.expect(main.page.input_pointer.down_target == null);
+    try testing.expectEqual(@as(u16, 0), main.page.input_pointer.held);
+    try testing.expect(!main.page.input_pointer.mousedown_suppressed);
+
+    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
+    try testing.expect((try main_ls.local.compileAndRun("events.join(',') === 'mouseup'", null)).isTrue());
+
+    // A stale suppression flag would drop this new gesture's mousedown.
+    try triggerMousePress(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
+    try testing.expect((try main_ls.local.compileAndRun("events.join(',') === 'mouseup,mousedown,mouseup,click'", null)).isTrue());
+    try testing.expect(main.page.input_pointer.down_target == null);
+    try testing.expectEqual(@as(u16, 0), main.page.input_pointer.held);
+    try testing.expect(!main.page.input_pointer.mousedown_suppressed);
+}
+
+test "user_input: wheel listener removing its iframe prevents the scroll default action" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+
+    var main_ls: js.Local.Scope = undefined;
+    main.js.localScope(&main_ls);
+    defer main_ls.deinit();
+    _ = try main_ls.local.compileAndRun(
+        \\window.parentWheels = 0;
+        \\window.wheelEvents = 0;
+        \\document.addEventListener('wheel', () => parentWheels++, true);
+    , null);
+
+    {
+        var child_ls: js.Local.Scope = undefined;
+        child.js.localScope(&child_ls);
+        defer child_ls.deinit();
+        _ = try child_ls.local.compileAndRun(
+            \\const box = document.createElement('div');
+            \\box.id = 'wheelBox';
+            \\box.setAttribute('style', 'width:80px;height:10px;overflow:auto');
+            \\const content = document.createElement('div');
+            \\content.setAttribute('style', 'height:100px');
+            \\box.appendChild(content);
+            \\document.body.appendChild(box);
+            \\box.addEventListener('wheel', () => {
+            \\  parent.wheelEvents++;
+            \\  parent.document.getElementById('child').remove();
+            \\});
+        , null);
+    }
+
+    const box = child.document.getElementById("wheelBox", child).?;
+    const box_rect = box.boundingClientRectValues(child);
+    const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
+    const x = box_rect.x + iframe_rect.x + 1;
+    const y = box_rect.y + iframe_rect.y + 1;
+    try testing.expect(box.getScrollHeight(child) > box.getClientHeight(child));
+    try testing.expectEqual(@as(u32, 0), box.getScrollTop(child));
+    const child_hit = (try child.document.elementFromPoint(box_rect.x + 1, box_rect.y + 1, child)).?;
+    try testing.expect(box.asNode().contains(child_hit.asNode()));
+
+    try triggerMouseWheel(main, x, y, 0, 20);
+
+    try testing.expect(child.window._closed);
+    try testing.expect((try main_ls.local.compileAndRun("wheelEvents === 1 && parentWheels === 0 && window.scrollY === 0", null)).isTrue());
+    const scroll: Element.ScrollPosition = main.page.element_scroll_positions.get(box) orelse .{};
+    try testing.expectEqual(@as(u32, 0), scroll.y);
+}
+
+test "user_input: mouse hover transitions cross nested iframe documents" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const nested = child.child_frames.items[0];
+
+    const outer = main.document.getElementById("outer", main).?;
+    const child_iframe = child.iframe.?.asElement();
+    const middle = child.document.getElementById("middle", child).?;
+    const nested_iframe = nested.iframe.?.asElement();
+    const inner = nested.document.getElementById("inner", nested).?;
+    const outer_rect = outer.boundingClientRectValues(main);
+    const child_rect = child_iframe.boundingClientRectValues(main);
+    const middle_rect = middle.boundingClientRectValues(child);
+    const nested_rect = nested_iframe.boundingClientRectValues(child);
+    const inner_rect = inner.boundingClientRectValues(nested);
+
+    var main_ls: js.Local.Scope = undefined;
+    main.js.localScope(&main_ls);
+    defer main_ls.deinit();
+    _ = try main_ls.local.compileAndRun(
+        \\window.events = [];
+        \\const watch = (where, el) => {
+        \\  for (const type of ['pointerout', 'pointerleave', 'pointerover', 'pointerenter', 'mouseout', 'mouseleave', 'mouseover', 'mouseenter']) {
+        \\    el.addEventListener(type, e => events.push({where, type, related: e.relatedTarget?.id || null, x: e.clientX, y: e.clientY}));
+        \\  }
+        \\};
+        \\const child = document.getElementById('child');
+        \\const middle = child.contentDocument.getElementById('middle');
+        \\const nested = child.contentDocument.getElementById('nested');
+        \\const inner = nested.contentDocument.getElementById('inner');
+        \\watch('outer', document.getElementById('outer'));
+        \\watch('child', child);
+    , null);
+
+    var child_ls: js.Local.Scope = undefined;
+    child.js.localScope(&child_ls);
+    defer child_ls.deinit();
+    _ = try child_ls.local.compileAndRun(
+        \\const watch = (where, el) => {
+        \\  for (const type of ['pointerout', 'pointerleave', 'pointerover', 'pointerenter', 'mouseout', 'mouseleave', 'mouseover', 'mouseenter']) {
+        \\    el.addEventListener(type, e => parent.events.push({where, type, related: e.relatedTarget?.id || null, x: e.clientX, y: e.clientY}));
+        \\  }
+        \\};
+        \\watch('middle', document.getElementById('middle'));
+        \\watch('nested', document.getElementById('nested'));
+    , null);
+
+    var nested_ls: js.Local.Scope = undefined;
+    nested.js.localScope(&nested_ls);
+    defer nested_ls.deinit();
+    _ = try nested_ls.local.compileAndRun(
+        \\const watch = (where, el) => {
+        \\  for (const type of ['pointerout', 'pointerleave', 'pointerover', 'pointerenter', 'mouseout', 'mouseleave', 'mouseover', 'mouseenter']) {
+        \\    el.addEventListener(type, e => parent.parent.events.push({where, type, related: e.relatedTarget?.id || null, x: e.clientX, y: e.clientY}));
+        \\  }
+        \\};
+        \\watch('inner', document.getElementById('inner'));
+    , null);
+
+    // Start on the top-level input, then enter the child input.
+    try triggerMouseMove(main, outer_rect.x + 1, outer_rect.y + 1);
+    _ = try main_ls.local.compileAndRun("events = []", null);
+    try triggerMouseMove(main, child_rect.x + middle_rect.x + 1, child_rect.y + middle_rect.y + 1);
+    try testing.expect((try main_ls.local.compileAndRun(
+        \\events.map(e => `${e.where}:${e.type}`).join(',') ===
+        \\'outer:pointerout,outer:mouseout,outer:pointerleave,outer:mouseleave,' +
+        \\'child:pointerover,child:mouseover,child:pointerenter,child:mouseenter,' +
+        \\'middle:pointerover,middle:mouseover,middle:pointerenter,middle:mouseenter' &&
+        \\events.find(e => e.where === 'outer' && e.type === 'pointerout').related === 'child' &&
+        \\events.find(e => e.where === 'child' && e.type === 'pointerover').related === 'outer' &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerover').related === null &&
+        \\events.find(e => e.where === 'outer' && e.type === 'pointerout').x === child.getBoundingClientRect().x + middle.getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'child' && e.type === 'pointerover').x === child.getBoundingClientRect().x + middle.getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerover').x === middle.getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerover').y === middle.getBoundingClientRect().y + 1
+    , null)).isTrue());
+
+    // Enter the nested frame from its parent document.
+    _ = try main_ls.local.compileAndRun("events = []", null);
+    const nested_x = child_rect.x + nested_rect.x + inner_rect.x + 1;
+    const nested_y = child_rect.y + nested_rect.y + inner_rect.y + 1;
+    try triggerMouseMove(main, nested_x, nested_y);
+    try testing.expect((try main_ls.local.compileAndRun(
+        \\events.map(e => `${e.where}:${e.type}`).join(',') ===
+        \\'middle:pointerout,middle:mouseout,middle:pointerleave,middle:mouseleave,' +
+        \\'nested:pointerover,nested:mouseover,nested:pointerenter,nested:mouseenter,' +
+        \\'inner:pointerover,inner:mouseover,inner:pointerenter,inner:mouseenter' &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerout').related === 'nested' &&
+        \\events.find(e => e.where === 'nested' && e.type === 'pointerover').related === 'middle' &&
+        \\events.find(e => e.where === 'inner' && e.type === 'pointerover').related === null &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerout').x === nested.getBoundingClientRect().x + inner.getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'nested' && e.type === 'pointerover').x === nested.getBoundingClientRect().x + inner.getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'inner' && e.type === 'pointerover').x === inner.getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'inner' && e.type === 'pointerover').y === inner.getBoundingClientRect().y + 1
+    , null)).isTrue());
+
+    // Leaving the nested frame keeps relatedTarget local to the child document.
+    _ = try main_ls.local.compileAndRun("events = []", null);
+    try triggerMouseMove(main, child_rect.x + middle_rect.x + 1, child_rect.y + middle_rect.y + 1);
+    try testing.expect((try main_ls.local.compileAndRun(
+        \\events.map(e => `${e.where}:${e.type}`).join(',') ===
+        \\'inner:pointerout,inner:mouseout,inner:pointerleave,inner:mouseleave,' +
+        \\'nested:pointerout,nested:mouseout,nested:pointerleave,nested:mouseleave,' +
+        \\'middle:pointerover,middle:mouseover,middle:pointerenter,middle:mouseenter' &&
+        \\events.find(e => e.where === 'inner' && e.type === 'pointerout').related === null &&
+        \\events.find(e => e.where === 'nested' && e.type === 'pointerout').related === 'middle' &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerover').related === 'nested' &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerover').x === middle.getBoundingClientRect().x + 1
+    , null)).isTrue());
+
+    // Leave the child frame for the top-level input.
+    _ = try main_ls.local.compileAndRun("events = []", null);
+    try triggerMouseMove(main, outer_rect.x + 1, outer_rect.y + 1);
+    try testing.expect((try main_ls.local.compileAndRun(
+        \\events.map(e => `${e.where}:${e.type}`).join(',') ===
+        \\'middle:pointerout,middle:mouseout,middle:pointerleave,middle:mouseleave,' +
+        \\'child:pointerout,child:mouseout,child:pointerleave,child:mouseleave,' +
+        \\'outer:pointerover,outer:mouseover,outer:pointerenter,outer:mouseenter' &&
+        \\events.find(e => e.where === 'middle' && e.type === 'pointerout').related === null &&
+        \\events.find(e => e.where === 'child' && e.type === 'pointerout').related === 'outer' &&
+        \\events.find(e => e.where === 'outer' && e.type === 'pointerover').related === 'child' &&
+        \\events.find(e => e.where === 'outer' && e.type === 'pointerover').x === document.getElementById('outer').getBoundingClientRect().x + 1 &&
+        \\events.find(e => e.where === 'outer' && e.type === 'pointerover').y === document.getElementById('outer').getBoundingClientRect().y + 1
     , null)).isTrue());
 }
