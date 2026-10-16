@@ -400,7 +400,7 @@ pub const PointerButtons = struct {
     /// Returns the element the click fired at, if any. `g.buttons_down` is
     /// ignored: the held mask supplies it.
     pub fn release(self: *PointerButtons, frame: *Frame, target: *Element, g: Gesture) !?*Element {
-        const click_target = if (self.down_target) |down| commonClickTarget(down, target) else null;
+        const click_target = if (self.down_target) |down| commonClickTarget(frame, down, target) else null;
         const was_suppressed = self.mousedown_suppressed;
         const was_pressed = self.down_target != null;
         self.releaseButton(g.button);
@@ -443,12 +443,14 @@ fn commonAncestor(a: *Node, b: *Node) ?*Node {
 
 /// A click whose mousedown and mouseup landed on different elements fires at
 /// their nearest common inclusive ancestor element.
-fn commonClickTarget(down: *Element, up: *Element) ?*Element {
+fn commonClickTarget(frame: *Frame, down: *Element, up: *Element) ?*Element {
+    const owner = down.ownerFrame(frame) orelse return null;
+    if (up.ownerFrame(frame) != owner) return null;
     if (down == up) {
         return up;
     }
-    const ancestor = commonAncestor(down.asNode(), up.asNode()) orelse return null;
-    return ancestor.is(Element);
+    const ancestor = commonAncestor(down.asNode(), up.asNode()) orelse return up;
+    return ancestor.is(Element) orelse up;
 }
 
 pub fn moveSequence(frame: *Frame, target: *Element, g: Gesture) !void {
@@ -1061,7 +1063,7 @@ pub fn touchEnd(frame: *Frame, point: ?Touch.Point, modifiers: Modifiers) !void 
     const up_target = try touchCompatTarget(owner, lift, pinned) orelse return;
     // Chrome drops the click when mousedown's target is removed before the
     // release.
-    const click_target = if (down_target.asNode().isConnected()) commonClickTarget(down_target, up_target) else null;
+    const click_target = if (down_target.asNode().isConnected()) commonClickTarget(owner, down_target, up_target) else null;
     try mouseUpAndClick(owner, up_target, g, false, click_target);
 }
 
@@ -2032,6 +2034,16 @@ test "user_input: an excluded child document root is not a mouse target" {
 
     const root = child.document.getDocumentElement().?;
 
+    var main_ls: js.Local.Scope = undefined;
+    main.js.localScope(&main_ls);
+    defer main_ls.deinit();
+    _ = try main_ls.local.compileAndRun(
+        \\window.parentEvents = [];
+        \\for (const type of ['pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'wheel']) {
+        \\  document.addEventListener(type, () => parentEvents.push(type), true);
+        \\}
+    , null);
+
     var child_ls: js.Local.Scope = undefined;
     child.js.localScope(&child_ls);
     defer child_ls.deinit();
@@ -2052,6 +2064,7 @@ test "user_input: an excluded child document root is not a mouse target" {
         try triggerMouseRelease(main, x, y, mouse_button.main, 1);
         try triggerMouseWheel(main, x, y, 0, 10);
         try testing.expect((try child_ls.local.compileAndRun("events.length === 0", null)).isTrue());
+        try testing.expect((try main_ls.local.compileAndRun("parentEvents.length === 0", null)).isTrue());
         try root.setStyle("", child);
     }
 }
