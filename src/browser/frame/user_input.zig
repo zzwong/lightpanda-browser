@@ -567,8 +567,16 @@ fn mouseHitTest(frame: *Frame, x: f64, y: f64) !?MouseHit {
         const rect = hit.target.boundingClientRectValues(hit.frame);
         const child_x = hit.x - rect.x - hit.target.getClientLeft();
         const child_y = hit.y - rect.y - hit.target.getClientTop();
-        const target = (try child.document.elementFromPoint(child_x, child_y, child)) orelse
-            child.document.getDocumentElement() orelse break;
+        // The iframe's client box is the child viewport. A point in its border
+        // stays on the iframe in the parent document.
+        if (child_x < 0 or child_y < 0 or
+            child_x >= hit.target.getClientWidth(hit.frame) or
+            child_y >= hit.target.getClientHeight(hit.frame)) break;
+        const target = if (try child.document.elementFromPoint(child_x, child_y, child)) |target| target else blk: {
+            const root = child.document.getDocumentElement() orelse break;
+            if (child._style_manager.hasDisplayNone(root) or !child._style_manager.isHitTestable(root)) return null;
+            break :blk root;
+        };
         hit = .{ .frame = child, .target = target, .x = child_x, .y = child_y };
     }
     return hit;
@@ -676,11 +684,18 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
 
 pub fn triggerMouseWheel(frame: *Frame, x: f64, y: f64, delta_x: f64, delta_y: f64) !void {
     const document = frame.window._document;
-    const hit = (try mouseHitTest(frame, x, y)) orelse MouseHit{
-        .frame = frame,
-        .target = document.getDocumentElement() orelse return,
-        .x = x,
-        .y = y,
+    const hit = if (try mouseHitTest(frame, x, y)) |hit| hit else blk: {
+        // A point over an iframe with no child hit does not fall back to the
+        // parent document element. Keep the root fallback for top-level misses.
+        if (try document.elementFromPoint(x, y, frame)) |target| {
+            if (target.is(Element.Html.IFrame) != null) return;
+        }
+        break :blk MouseHit{
+            .frame = frame,
+            .target = document.getDocumentElement() orelse return,
+            .x = x,
+            .y = y,
+        };
     };
     const target = hit.target;
     if (comptime lp.IS_DEBUG) {
@@ -2003,4 +2018,82 @@ test "user_input: removing hit iframe in pointerdown stops its mouse sequence" {
     try testing.expect(main.page.input_pointer.down_target == null);
     try testing.expectEqual(0, main.page.input_pointer.held);
     try testing.expect(!main.page.input_pointer.mousedown_suppressed);
+}
+
+test "user_input: an excluded child document root is not a mouse target" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const iframe = child.iframe.?.asElement();
+    const rect = iframe.boundingClientRectValues(main);
+    const x = rect.x + 1;
+    const y = rect.y + 1;
+
+    const root = child.document.getDocumentElement().?;
+
+    var child_ls: js.Local.Scope = undefined;
+    child.js.localScope(&child_ls);
+    defer child_ls.deinit();
+    _ = try child_ls.local.compileAndRun(
+        \\window.events = [];
+        \\for (const type of ['pointerover', 'mouseover', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'wheel']) {
+        \\  document.addEventListener(type, () => events.push(type), true);
+        \\}
+    , null);
+
+    for ([_][]const u8{ "display: none", "pointer-events: none" }) |style| {
+        try root.setStyle(style, child);
+        try testing.expect((try main.document.elementFromPoint(x, y, main)) == iframe);
+        try testing.expect((try child.document.elementFromPoint(1, 1, child)) == null);
+
+        try triggerMouseMove(main, x, y);
+        try triggerMousePress(main, x, y, mouse_button.main, 1);
+        try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+        try triggerMouseWheel(main, x, y, 0, 10);
+        try testing.expect((try child_ls.local.compileAndRun("events.length === 0", null)).isTrue());
+        try root.setStyle("", child);
+    }
+}
+
+test "user_input: mouse hit testing still enters a blank child document" {
+    const page = try testing.pageTest("input_mouse_frames.html", .{});
+    defer page.close();
+    const main = page.frame().?;
+    const child = main.child_frames.items[0];
+    const iframe = child.iframe.?;
+    const rect = iframe.asElement().boundingClientRectValues(main);
+    const x = rect.x + 1;
+    const y = rect.y + 1;
+    const edge_hit = try mouseHitTest(main, rect.x + iframe.asElement().getClientWidth(main), y);
+    try testing.expect(edge_hit != null);
+    try testing.expect(edge_hit.?.frame == main);
+    try testing.expect(edge_hit.?.target == iframe.asElement());
+
+    var ls: js.Local.Scope = undefined;
+    child.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("document.documentElement.replaceChildren()", null);
+
+    const hit = try mouseHitTest(main, x, y);
+    try testing.expect((try main.document.elementFromPoint(x, y, main)) == iframe.asElement());
+    try testing.expect((try child.document.elementFromPoint(1, 1, child)) == null);
+    try testing.expect(hit != null);
+    try testing.expect(hit.?.frame == child);
+    try testing.expect(hit.?.target == child.document.getDocumentElement().?);
+
+    _ = try ls.local.compileAndRun(
+        \\window.events = [];
+        \\for (const type of ['pointerover', 'mouseover', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        \\  document.addEventListener(type, e => events.push({type, target: e.target.tagName, x: e.clientX, y: e.clientY}), true);
+        \\}
+    , null);
+
+    try triggerMouseMove(main, x, y);
+    try triggerMousePress(main, x, y, mouse_button.main, 1);
+    try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+    try testing.expect((try ls.local.compileAndRun(
+        \\events.map(e => e.type).join(',') === 'pointerover,mouseover,pointermove,mousemove,pointerdown,mousedown,pointerup,mouseup,click' &&
+        \\events.every(e => e.target === 'HTML' && e.x === 1 && e.y === 1)
+    , null)).isTrue());
 }
