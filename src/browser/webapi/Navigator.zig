@@ -138,11 +138,11 @@ fn javaEnabled(_: *const Navigator) bool {
     return false;
 }
 
-/// Noop, signal that the data was successfully queued
+/// Returns false because beacon requests are not queued yet.
 fn sendBeacon(_: *const Navigator, url: js.Value, data: ?js.Value) bool {
     _ = url;
     _ = data;
-    return true;
+    return false;
 }
 
 fn getPlugins(self: *Navigator) *PluginArray {
