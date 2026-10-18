@@ -132,7 +132,7 @@ fn parseSheet(self: *StyleManager, build_arena: Allocator, sheet: *CSSStyleSheet
 
     const owner_node = sheet.getOwnerNode() orelse return;
     if (owner_node.is(Element.Html.Style)) |style| {
-        const text = try style.asNode().getTextContentAlloc(self.arena.allocator());
+        const text = sheet._source orelse try style.asNode().getTextContentAlloc(self.arena.allocator());
         var it = CssParser.parseStylesheet(text);
         while (it.next()) |parsed_rule| {
             switch (parsed_rule) {

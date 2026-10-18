@@ -1013,9 +1013,9 @@ pub fn moveBefore(self: *Node, node_val: js.Value, child_val: js.Value, frame: *
     }
 
     if (ref) |r| {
-        try frame.insertNodeRelative(self, node, .{ .before = r }, .{ .previous_root = previous_root });
+        try frame.insertNodeRelative(self, node, .{ .before = r }, .{ .previous_root = previous_root, .preserve_style_sheets = true });
     } else {
-        try frame.appendNode(self, node, .{ .previous_root = previous_root });
+        try frame.appendNode(self, node, .{ .previous_root = previous_root, .preserve_style_sheets = true });
     }
 
     if (old_parent) |op| {
@@ -1396,6 +1396,7 @@ fn _normalize(self: *Node, allocator: Allocator, buffer: *std.ArrayList(u8), fra
                     frame.removeNode(self, to_remove, .{ .reconnect_to = null });
                 }
                 text_node.asCData()._data = try frame.dupeSSO(buffer.items);
+                frame.styleChildrenChanged(self);
                 buffer.clearRetainingCapacity();
             }
         }
@@ -1617,6 +1618,7 @@ pub fn setHTML(self: *Node, html: []const u8, opts: Frame.parse.FragmentParseOpt
     if (html.len > 0) {
         try Frame.parse.fragment(frame, self, html, opts);
     }
+    frame.styleChildrenChanged(self);
 
     if (notify) {
         var added: std.ArrayList(*Node) = .empty;

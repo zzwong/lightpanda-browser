@@ -26,7 +26,21 @@ pub fn item(self: *const StyleSheetList, index: usize) ?*CSSStyleSheet {
 }
 
 pub fn add(self: *StyleSheetList, sheet: *CSSStyleSheet, frame: *Frame) !void {
+    for (self._sheets.items) |existing| {
+        if (existing == sheet) return;
+    }
     try self._sheets.append(frame.page_arena, sheet);
+    // A moved subtree can contain several styles. The remaining registrations
+    // need not already be sorted while its ready callbacks run, so reorder
+    // the whole list rather than inserting into an assumed-sorted prefix.
+    std.sort.insertion(*CSSStyleSheet, self._sheets.items, {}, struct {
+        fn lessThan(_: void, a: *CSSStyleSheet, b: *CSSStyleSheet) bool {
+            const owner = a.getOwnerNode() orelse return false;
+            const other = b.getOwnerNode() orelse return false;
+            const position = owner.asNode().compareDocumentPosition(other.asNode());
+            return position & 0x01 == 0 and position & 0x04 != 0;
+        }
+    }.lessThan);
 }
 
 pub fn remove(self: *StyleSheetList, sheet: *CSSStyleSheet) void {
