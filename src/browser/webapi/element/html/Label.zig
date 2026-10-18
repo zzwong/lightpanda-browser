@@ -112,6 +112,8 @@ pub fn getControlLabels(control: *Element, frame: *Frame) !js.Array {
     const local = frame.js.local orelse return error.NotHandled;
     var arr = local.newArray(0);
     var idx: u32 = 0;
+    const wrapping_label = findWrappingLabel(control);
+    var wrapping_label_collected = false;
 
     if (control.getId()) |id_value| {
         if (id_value.len > 0) {
@@ -124,13 +126,18 @@ pub fn getControlLabels(control: *Element, frame: *Frame) !js.Array {
                 if (!std.mem.eql(u8, for_attr, id_value)) continue;
                 _ = try arr.set(idx, el, .{});
                 idx += 1;
+                if (wrapping_label) |wrap_label| {
+                    if (el == wrap_label) wrapping_label_collected = true;
+                }
             }
         }
     }
 
-    if (findWrappingLabel(control)) |wrap_label| {
-        _ = try arr.set(idx, wrap_label, .{});
-        idx += 1;
+    if (wrapping_label) |wrap_label| {
+        if (!wrapping_label_collected) {
+            _ = try arr.set(idx, wrap_label, .{});
+            idx += 1;
+        }
     }
 
     return arr;

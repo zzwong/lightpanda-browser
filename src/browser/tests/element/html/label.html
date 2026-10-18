@@ -72,3 +72,42 @@
     testing.expectEqual(null, lDetached.control);
   }
 </script>
+
+<label id="labels-both" for="labels-input-both"><input id="labels-input-both"></label>
+<label id="labels-wrap"><input id="labels-input-wrap"></label>
+<label id="labels-external" for="labels-input-external">External</label>
+<input id="labels-input-external">
+<label id="labels-multiple-external" for="labels-input-multiple">External</label>
+<label id="labels-multiple-wrap" for="labels-input-multiple"><input id="labels-input-multiple"></label>
+<label id="labels-select-both" for="labels-select"><select id="labels-select"><option>a</option></select></label>
+
+<script id="labels">
+  {
+    // One label associated by both for and nesting must appear only once.
+    const both = document.getElementById('labels-both');
+    const bothLabels = document.getElementById('labels-input-both').labels;
+    testing.expectEqual(1, bothLabels.length);
+    testing.expectTrue(bothLabels[0] === both);
+
+    const wrap = document.getElementById('labels-wrap');
+    const wrapLabels = document.getElementById('labels-input-wrap').labels;
+    testing.expectEqual(1, wrapLabels.length);
+    testing.expectTrue(wrapLabels[0] === wrap);
+
+    const external = document.getElementById('labels-external');
+    const externalLabels = document.getElementById('labels-input-external').labels;
+    testing.expectEqual(1, externalLabels.length);
+    testing.expectTrue(externalLabels[0] === external);
+
+    // Keep distinct labels even when the wrapping label also has a matching for.
+    const multipleLabels = document.getElementById('labels-input-multiple').labels;
+    testing.expectEqual(2, multipleLabels.length);
+    testing.expectTrue(multipleLabels[0] === document.getElementById('labels-multiple-external'));
+    testing.expectTrue(multipleLabels[1] === document.getElementById('labels-multiple-wrap'));
+
+    // Select uses the same label collection helper as input.
+    const selectLabels = document.getElementById('labels-select').labels;
+    testing.expectEqual(1, selectLabels.length);
+    testing.expectTrue(selectLabels[0] === document.getElementById('labels-select-both'));
+  }
+</script>
