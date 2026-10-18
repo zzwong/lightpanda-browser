@@ -2044,7 +2044,14 @@ fn calculateDocumentPosition(node: *Node) f64 {
         current = parent;
     }
 
-    return position * 5.0; // 5px per node
+    // A shadow tree has its own preorder, anchored at its host. It is not
+    // an independent viewport: nested roots accumulate host positions, and
+    // boundingClientRectValues subtracts the owning window's scroll once.
+    const host_position = if (current.is(ShadowRoot)) |root|
+        calculateDocumentPosition(root._host.asNode())
+    else
+        0;
+    return host_position + position * 5.0; // 5px per node
 }
 
 // Counts total nodes in a subtree (node + all descendants)
@@ -2091,6 +2098,11 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
         current = parent;
     }
 
+    // The ordinary parent walk stops at the shadow root. Include the host's
+    // siblings and transforms using the same faux-layout coordinate system.
+    if (current.is(ShadowRoot)) |root| {
+        x += root._host.horizontalPosition(frame);
+    }
     return x;
 }
 
