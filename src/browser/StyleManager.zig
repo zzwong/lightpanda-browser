@@ -1447,23 +1447,11 @@ pub const Length = packed struct(u35) {
 /// Keep them separate from sizes, whose negative values are invalid.
 pub const InsetLength = packed struct(u35) {
     value: f32 = 0,
-    unit: enum(u3) { auto, px, percentage, vw, vh } = .auto,
+    unit: CssParser.InsetUnit = .auto,
 
     fn parse(text: []const u8) ?InsetLength {
-        if (std.ascii.eqlIgnoreCase(text, "auto") or std.ascii.eqlIgnoreCase(text, "initial") or std.ascii.eqlIgnoreCase(text, "unset")) return .{};
-        const parsed = units.parse(text) catch return null;
-        if (@abs(parsed.value) > std.math.floatMax(f32)) return null;
-        return switch (parsed.unit) {
-            .percentage => .{ .value = @floatCast(parsed.value), .unit = .percentage },
-            .vw => .{ .value = @floatCast(parsed.value), .unit = .vw },
-            .vh => .{ .value = @floatCast(parsed.value), .unit = .vh },
-            .none => if (parsed.value == 0) .{ .unit = .px } else null,
-            else => blk: {
-                const pixels = parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse return null);
-                if (@abs(pixels) > std.math.floatMax(f32)) return null;
-                break :blk .{ .value = @floatCast(pixels), .unit = .px };
-            },
-        };
+        const parsed = CssParser.parseInset(text) orelse return null;
+        return .{ .value = parsed.value, .unit = parsed.unit };
     }
 
     pub fn resolve(self: InsetLength, extent: f64, viewport: Viewport) ?f64 {
@@ -1972,19 +1960,10 @@ fn Slots(comptime Declared: type) type {
 
         fn apply(self: *Self, name: []const u8, value: []const u8, important: bool) void {
             if (std.ascii.eqlIgnoreCase(name, "inset")) {
-                var parts: [4][]const u8 = undefined;
-                var count: usize = 0;
-                var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
-                while (it.next()) |part| {
-                    if (count == 4 or InsetLength.parse(part) == null) return;
-                    parts[count] = part;
-                    count += 1;
+                const parts = CssParser.splitInset(value) orelse return;
+                for (CssParser.inset_sides, parts) |side, part| {
+                    self.apply(side, part, important);
                 }
-                if (count == 0) return;
-                self.apply("top", parts[0], important);
-                self.apply("right", parts[if (count > 1) 1 else 0], important);
-                self.apply("bottom", parts[if (count > 2) 2 else 0], important);
-                self.apply("left", parts[if (count > 3) 3 else if (count > 1) 1 else 0], important);
                 return;
             }
             if (CssParser.axisShorthand(name)) |shorthand| {

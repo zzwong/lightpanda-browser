@@ -1806,8 +1806,14 @@ fn positionedClientRectAt(self: *Element, frame: *Frame, depth: u8) ?DOMRect.Dat
     var height = self.unpositionedBoxAxis(frame, .height);
     if (!own_width.explicit and left != null and right != null) width = @max(0, containing.width - left.? - right.?);
     if (!own_height.explicit and top != null and bottom != null) height = @max(0, containing.height - top.? - bottom.?);
+    var translate_x: f64 = 0;
+    if (left != null or right != null) {
+        if (self.inlineStyle(frame)) |style| {
+            translate_x = CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+        }
+    }
     return .{
-        .x = if (left) |v| containing.x + v else if (right) |v| containing.x + containing.width - v - width else self.horizontalPosition(frame) - scroll_x,
+        .x = translate_x + if (left) |v| containing.x + v else if (right) |v| containing.x + containing.width - v - width else self.horizontalPosition(frame) - scroll_x,
         .y = if (top) |v| containing.y + v else if (bottom) |v| containing.y + containing.height - v - height else calculateDocumentPosition(self.asNode(), frame) - scroll_y,
         .width = width,
         .height = height,

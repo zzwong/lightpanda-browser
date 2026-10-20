@@ -59,6 +59,36 @@ testing.expectEqual(p.left + 40, child.getBoundingClientRect().left);
 child.style.cssText = 'position:absolute;left:40px;inset:10px;width:20px;height:20px';
 testing.expectEqual(p.left + 10, child.getBoundingClientRect().left);
 </script>
+<script id="inset_longhands_track_imperative_cssom_changes">
+child.style.cssText = 'position:absolute;left:40px;inset:10px;width:20px;height:20px';
+child.style.left = '50px';
+testing.expectEqual(p.left + 50, child.getBoundingClientRect().left);
+testing.expectEqual('10px 10px 10px 50px', child.style.getPropertyValue('inset'));
+child.style.cssText = 'position:absolute;inset:10px !important;width:20px;height:20px';
+child.style.left = '50px';
+testing.expectEqual(p.left + 50, child.getBoundingClientRect().left);
+testing.expectEqual('', child.style.getPropertyPriority('left'));
+testing.expectEqual('important', child.style.getPropertyPriority('top'));
+const materialized = child.getBoundingClientRect().left;
+child.style.cssText = child.style.cssText;
+testing.expectEqual(materialized, child.getBoundingClientRect().left);
+child.style.setProperty('inset', '5px 6px 7px 8px', 'important');
+testing.expectEqual('5px 6px 7px 8px', child.style.getPropertyValue('inset'));
+testing.expectEqual('important', child.style.getPropertyPriority('inset'));
+testing.expectEqual(p.left + 8, child.getBoundingClientRect().left);
+child.style.removeProperty('inset');
+testing.expectEqual('', child.style.getPropertyValue('left'));
+testing.expectEqual('', child.style.getPropertyValue('inset'));
+child.style.cssText = 'position:absolute;left:40px;inset:10px bogus;width:20px;height:20px';
+testing.expectEqual(p.left + 40, child.getBoundingClientRect().left);
+testing.expectEqual('40px', child.style.left);
+testing.expectEqual(p.left + 40, child.getBoundingClientRect().left);
+child.style.setProperty('inset', 'unset auto');
+testing.expectEqual('40px', child.style.left);
+child.style.setProperty('inset', '15px');
+child.style.removeProperty('inset');
+testing.expectEqual('', child.style.getPropertyValue('top'));
+</script>
 <script id="right_and_bottom_with_explicit_size">
 child.style.cssText = 'position:absolute;right:25px;bottom:15px;width:40px;height:20px';
 c = child.getBoundingClientRect();
@@ -80,4 +110,14 @@ cover.style.pointerEvents = 'none';
 testing.expectEqual('under', document.elementFromPoint(x, y).id);
 cover.style.pointerEvents = '';
 testing.expectEqual('cover', document.elementFromPoint(x, y).id);
+</script>
+
+<script id="positioned_rect_preserves_own_inline_translate_x">
+document.body.innerHTML = '<div id="translated" style="position:fixed;left:0;top:0;transform:translateX(100px);width:20px;height:20px"></div>';
+const translated = document.getElementById('translated');
+testing.expectEqual(100, translated.getBoundingClientRect().left);
+testing.expectEqual('translated', document.elementFromPoint(105, 5).id);
+testing.expectTrue(document.elementFromPoint(5, 5) !== translated);
+translated.style.cssText = 'position:fixed;right:0;top:0;transform:translateX(-100px);width:20px;height:20px';
+testing.expectEqual(window.innerWidth - 120, translated.getBoundingClientRect().left);
 </script>
