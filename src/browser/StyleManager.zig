@@ -760,6 +760,20 @@ pub fn declaredSize(self: *StyleManager, el: *Element, comptime axis: Element.Ax
     return length.resolve(self.frame.page.getViewport());
 }
 
+pub const Insets = struct {
+    top: InsetLength,
+    right: InsetLength,
+    bottom: InsetLength,
+    left: InsetLength,
+};
+
+pub fn positioningInsets(self: *StyleManager, el: *Element) Insets {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .{ .top = .{}, .right = .{}, .bottom = .{}, .left = .{} };
+    const p = self.geometryProps(el);
+    return .{ .top = p.top, .right = p.right, .bottom = p.bottom, .left = p.left };
+}
+
 /// Like declaredSize, but only the inline style counts.
 pub fn inlineSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
     self.assertOwns(el);
@@ -1429,6 +1443,41 @@ pub const Length = packed struct(u35) {
     }
 };
 
+/// Insets allow negative lengths and percentages of the containing block.
+/// Keep them separate from sizes, whose negative values are invalid.
+pub const InsetLength = packed struct(u35) {
+    value: f32 = 0,
+    unit: enum(u3) { auto, px, percentage, vw, vh } = .auto,
+
+    fn parse(text: []const u8) ?InsetLength {
+        if (std.ascii.eqlIgnoreCase(text, "auto") or std.ascii.eqlIgnoreCase(text, "initial") or std.ascii.eqlIgnoreCase(text, "unset")) return .{};
+        const parsed = units.parse(text) catch return null;
+        if (@abs(parsed.value) > std.math.floatMax(f32)) return null;
+        return switch (parsed.unit) {
+            .percentage => .{ .value = @floatCast(parsed.value), .unit = .percentage },
+            .vw => .{ .value = @floatCast(parsed.value), .unit = .vw },
+            .vh => .{ .value = @floatCast(parsed.value), .unit = .vh },
+            .none => if (parsed.value == 0) .{ .unit = .px } else null,
+            else => blk: {
+                const pixels = parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse return null);
+                if (@abs(pixels) > std.math.floatMax(f32)) return null;
+                break :blk .{ .value = @floatCast(pixels), .unit = .px };
+            },
+        };
+    }
+
+    pub fn resolve(self: InsetLength, extent: f64, viewport: Viewport) ?f64 {
+        const value: f64 = self.value;
+        return switch (self.unit) {
+            .auto => null,
+            .px => value,
+            .percentage => value * extent / 100,
+            .vw => value * @as(f64, @floatFromInt(viewport.width)) / 100,
+            .vh => value * @as(f64, @floatFromInt(viewport.height)) / 100,
+        };
+    }
+};
+
 /// Whether an element is rendered and takes pointer input.
 const Visibility = struct {
     const Declared = struct {
@@ -1516,7 +1565,7 @@ const Visibility = struct {
 /// An element's box: its size and how it scrolls.
 const Geometry = struct {
     const Declared = struct {
-        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height" };
+        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "top", "right", "bottom", "left" };
 
         overflow_x_scrolls: ?bool = null,
         overflow_y_scrolls: ?bool = null,
@@ -1524,6 +1573,10 @@ const Geometry = struct {
         overscroll_y_contains: ?bool = null,
         width: ?Length = null,
         height: ?Length = null,
+        top: ?InsetLength = null,
+        right: ?InsetLength = null,
+        bottom: ?InsetLength = null,
+        left: ?InsetLength = null,
 
         fn apply(self: *Declared, name: []const u8, value: []const u8) void {
             if (std.ascii.eqlIgnoreCase(name, "overflow-x")) {
@@ -1538,6 +1591,10 @@ const Geometry = struct {
                 self.width = Length.parse(value);
             } else if (std.ascii.eqlIgnoreCase(name, "height")) {
                 self.height = Length.parse(value);
+            } else {
+                inline for (.{ "top", "right", "bottom", "left" }) |side| {
+                    if (std.ascii.eqlIgnoreCase(name, side)) @field(self, side) = InsetLength.parse(value);
+                }
             }
         }
 
@@ -1556,13 +1613,17 @@ const Geometry = struct {
         }
     };
 
-    const Computed = packed struct(u74) {
+    const Computed = packed struct(u214) {
         overflow_x_scrolls: bool = false,
         overflow_y_scrolls: bool = false,
         overscroll_x_contains: bool = false,
         overscroll_y_contains: bool = false,
         width: Length = .{},
         height: Length = .{},
+        top: InsetLength = .{},
+        right: InsetLength = .{},
+        bottom: InsetLength = .{},
+        left: InsetLength = .{},
     };
 };
 
@@ -1910,6 +1971,22 @@ fn Slots(comptime Declared: type) type {
         slots: [Declared.names.len]Slot = @splat(.{}),
 
         fn apply(self: *Self, name: []const u8, value: []const u8, important: bool) void {
+            if (std.ascii.eqlIgnoreCase(name, "inset")) {
+                var parts: [4][]const u8 = undefined;
+                var count: usize = 0;
+                var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
+                while (it.next()) |part| {
+                    if (count == 4 or InsetLength.parse(part) == null) return;
+                    parts[count] = part;
+                    count += 1;
+                }
+                if (count == 0) return;
+                self.apply("top", parts[0], important);
+                self.apply("right", parts[if (count > 1) 1 else 0], important);
+                self.apply("bottom", parts[if (count > 2) 2 else 0], important);
+                self.apply("left", parts[if (count > 3) 3 else if (count > 1) 1 else 0], important);
+                return;
+            }
             if (CssParser.axisShorthand(name)) |shorthand| {
                 const values = CssParser.splitAxisPair(value) orelse return;
                 self.apply(shorthand.x, values.x, important);
