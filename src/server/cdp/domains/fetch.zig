@@ -96,7 +96,7 @@ const EnableParam = struct {
 };
 
 fn commandSessionId(cmd: *CDP.Command, bc: *CDP.BrowserContext) ![]const u8 {
-    if (cmd.input.session_id) |session_id| {
+    if (cmd.sessionId()) |session_id| {
         return cmd.cdp.resolveSessionId(session_id) orelse error.UnknownSessionId;
     }
     return bc.session_id orelse error.UnknownSessionId;

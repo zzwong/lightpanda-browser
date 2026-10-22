@@ -354,15 +354,10 @@ fn sendMessageToTarget(cmd: *CDP.Command) !void {
         return error.TargetNotLoaded;
     }
 
-    const session_id = bc.session_id orelse return error.UnknownSessionId;
-    if (std.mem.eql(u8, session_id, params.sessionId) == false) {
-        // Is this right? Is the params.sessionId meant to be the active
-        // sessionId? What else could it be? We have no other session_id.
-        return error.UnknownSessionId;
-    }
+    if (!bc.attached_sessions.contains(params.sessionId)) return error.UnknownSessionId;
 
     var aw = std.Io.Writer.Allocating.init(cmd.arena);
-    cmd.cdp.dispatchForContext(cmd.arena, .{ .capture = &aw.writer }, params.message, bc) catch |err| {
+    cmd.cdp.dispatch(cmd.arena, .{ .capture = &aw.writer }, params.message, params.sessionId) catch |err| {
         log.debug(.cdp, "internal dispatch error", .{ .err = err, .id = cmd.input.id, .message = params.message });
         return err;
     };
@@ -435,7 +430,7 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
         filter: ?[]const TargetFilter = null,
     })) orelse return error.InvalidParams;
 
-    if (cmd.input.session_id) |session_id| {
+    if (cmd.sessionId()) |session_id| {
         if (cmd.browser_context) |bc| {
             if (bc.attached_sessions.contains(session_id)) return cmd.sendResult(null, .{});
         }
