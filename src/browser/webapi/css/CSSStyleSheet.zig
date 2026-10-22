@@ -28,6 +28,8 @@ _href: ?[]const u8 = null,
 _title: []const u8 = "",
 _disabled: bool = false,
 _css_rules: ?*CSSRuleList = null,
+// Immutable source of an inline sheet, retained after its owner is detached.
+_source: ?[]const u8 = null,
 _owner_rule: ?*CSSRule = null,
 _owner_node: ?*Element = null,
 
@@ -70,7 +72,9 @@ fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
     const rules = try CSSRuleList.init(frame);
     self._css_rules = rules;
 
-    if (self.getOwnerNode()) |owner| {
+    if (self._source) |source| {
+        try self.parseInto(source, frame);
+    } else if (self.getOwnerNode()) |owner| {
         if (owner.is(Element.Html.Style)) |style| {
             // Same cascade as the text StyleManager already parsed: no notify.
             const text = try style.asNode().getTextContentAlloc(frame.local_arena);
@@ -226,7 +230,7 @@ pub const JsApi = struct {
     };
 
     pub const constructor = bridge.constructor(CSSStyleSheet.init, .{});
-    pub const ownerNode = bridge.accessor(CSSStyleSheet.getOwnerNode, null, .{ .null_as_undefined = true });
+    pub const ownerNode = bridge.accessor(CSSStyleSheet.getOwnerNode, null, .{});
     pub const href = bridge.accessor(CSSStyleSheet.getHref, null, .{ .null_as_undefined = true });
     pub const title = bridge.accessor(CSSStyleSheet.getTitle, null, .{});
     pub const disabled = bridge.accessor(CSSStyleSheet.getDisabled, CSSStyleSheet.setDisabled, .{});

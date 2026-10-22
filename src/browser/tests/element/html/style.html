@@ -140,3 +140,247 @@
   testing.expectEqual('5px', sheet.cssRules[0].style.padding);
 }
 </script>
+
+<body>
+<script id="children-change-replaces-lazy-sheet">
+{
+  for (const materialized of [false]) {
+    const probe = document.createElement('div');
+    probe.id = 'lifecycle-probe';
+    probe.style.cssText = 'width: 10px; height: 10px';
+    document.body.appendChild(probe);
+    const style = document.createElement('style');
+    style.textContent = '#lifecycle-probe { width: 25px !important }';
+    document.head.appendChild(style);
+    const oldSheet = style.sheet;
+    if (materialized) testing.expectEqual(1, oldSheet.cssRules.length);
+    const count = document.styleSheets.length;
+    testing.expectEqual(25, probe.getBoundingClientRect().width);
+    style.textContent = '#lifecycle-probe { width: 75px !important }';
+    testing.expectEqual(75, probe.getBoundingClientRect().width);
+    testing.expectTrue(style.sheet !== oldSheet);
+    testing.expectEqual(null, oldSheet.ownerNode);
+    testing.expectEqual('25px', oldSheet.cssRules[0].style.width);
+    testing.expectEqual('75px', style.sheet.cssRules[0].style.width);
+    testing.expectEqual(count, document.styleSheets.length);
+    oldSheet.insertRule('#lifecycle-probe { width: 95px !important }', 1);
+    testing.expectEqual(75, probe.getBoundingClientRect().width);
+    style.textContent = '';
+    testing.expectEqual(10, probe.getBoundingClientRect().width);
+    testing.expectEqual(0, style.sheet.cssRules.length);
+    testing.expectEqual(count, document.styleSheets.length);
+    style.textContent = '#lifecycle-probe { width: 45px !important }';
+    testing.expectEqual(45, probe.getBoundingClientRect().width);
+    style.remove(); probe.remove();
+  }
+}
+</script>
+<script id="children-change-replaces-materialized-sheet">
+{
+  for (const materialized of [true]) {
+    const probe = document.createElement('div');
+    probe.id = 'lifecycle-probe';
+    probe.style.cssText = 'width: 10px; height: 10px';
+    document.body.appendChild(probe);
+    const style = document.createElement('style');
+    style.textContent = '#lifecycle-probe { width: 25px !important }';
+    document.head.appendChild(style);
+    const oldSheet = style.sheet;
+    if (materialized) testing.expectEqual(1, oldSheet.cssRules.length);
+    const count = document.styleSheets.length;
+    testing.expectEqual(25, probe.getBoundingClientRect().width);
+    style.textContent = '#lifecycle-probe { width: 75px !important }';
+    testing.expectEqual(75, probe.getBoundingClientRect().width);
+    testing.expectTrue(style.sheet !== oldSheet);
+    testing.expectEqual(null, oldSheet.ownerNode);
+    testing.expectEqual('25px', oldSheet.cssRules[0].style.width);
+    testing.expectEqual('75px', style.sheet.cssRules[0].style.width);
+    testing.expectEqual(count, document.styleSheets.length);
+    oldSheet.insertRule('#lifecycle-probe { width: 95px !important }', 1);
+    testing.expectEqual(75, probe.getBoundingClientRect().width);
+    style.textContent = '';
+    testing.expectEqual(10, probe.getBoundingClientRect().width);
+    testing.expectEqual(0, style.sheet.cssRules.length);
+    testing.expectEqual(count, document.styleSheets.length);
+    style.textContent = '#lifecycle-probe { width: 45px !important }';
+    testing.expectEqual(45, probe.getBoundingClientRect().width);
+    style.remove(); probe.remove();
+  }
+}
+</script>
+<script id="children-change-mutation-paths">
+{
+  const probe = document.createElement('div');
+  probe.id = 'lifecycle-data'; probe.style.cssText = 'width: 10px; height: 10px';
+  document.body.appendChild(probe);
+  const style = document.createElement('style');
+  style.textContent = '#lifecycle-data { width: 25px !important }';
+  document.head.appendChild(style);
+  testing.expectEqual(25, probe.getBoundingClientRect().width);
+  style.firstChild.data = '#lifecycle-data { width: 35px !important }';
+  testing.expectEqual(35, probe.getBoundingClientRect().width);
+  const extra = document.createTextNode('#lifecycle-data { width: 65px !important }');
+  style.appendChild(extra);
+  testing.expectEqual(65, probe.getBoundingClientRect().width);
+  style.removeChild(extra);
+  testing.expectEqual(35, probe.getBoundingClientRect().width);
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(document.createTextNode('#lifecycle-data {'));
+  fragment.appendChild(document.createTextNode('width: 85px !important }'));
+  style.replaceChildren(fragment);
+  testing.expectEqual(85, probe.getBoundingClientRect().width);
+  style.innerHTML = '#lifecycle-data { width: 55px !important }';
+  testing.expectEqual(55, probe.getBoundingClientRect().width);
+  const old = style.sheet;
+  style.remove();
+  testing.expectEqual(null, old.ownerNode);
+  testing.expectEqual(10, probe.getBoundingClientRect().width);
+  style.firstChild.data = '#lifecycle-data { width: 95px !important }';
+  testing.expectEqual(null, style.sheet);
+  document.head.appendChild(style);
+  testing.expectEqual(95, probe.getBoundingClientRect().width);
+  style.remove(); probe.remove();
+}
+</script>
+<script id="children-change-sheet-order">
+{
+  const probe = document.createElement('div'); probe.id = 'lifecycle-order';
+  probe.style.cssText = 'width: 10px; height: 10px'; document.body.appendChild(probe);
+  const first = document.createElement('style'), last = document.createElement('style');
+  first.textContent = '#lifecycle-order { width: 25px !important }';
+  last.textContent = '#lifecycle-order { width: 50px !important }';
+  document.head.append(first, last);
+  const count = document.styleSheets.length;
+  testing.expectEqual(50, probe.getBoundingClientRect().width);
+  first.textContent = '#lifecycle-order { width: 75px !important }';
+  testing.expectEqual(50, probe.getBoundingClientRect().width);
+  testing.expectEqual(first.sheet, document.styleSheets[count - 2]);
+  testing.expectEqual(last.sheet, document.styleSheets[count - 1]);
+  testing.expectEqual(count, document.styleSheets.length);
+  last.remove(); testing.expectEqual(75, probe.getBoundingClientRect().width);
+  first.remove(); probe.remove();
+}
+</script>
+<script id="children-change-owner-frame" type="module">
+  const state = await testing.async();
+  const iframe = document.createElement('iframe');
+  iframe.srcdoc = '<!doctype html><html><head><style>#owner-probe { width: 25px !important }</style></head><body><div id="owner-probe" style="width:10px;height:10px"></div></body></html>';
+  iframe.onload = () => state.resolve();
+  document.body.appendChild(iframe);
+  await state.done(() => {
+    const doc = iframe.contentDocument, style = doc.querySelector('style'), probe = doc.getElementById('owner-probe');
+    const parentCount = document.styleSheets.length, old = style.sheet;
+    testing.expectEqual(1, old.cssRules.length);
+    testing.expectEqual(25, probe.getBoundingClientRect().width);
+    style.textContent = '#owner-probe { width: 75px !important }';
+    testing.expectEqual(75, probe.getBoundingClientRect().width);
+    testing.expectEqual(null, old.ownerNode);
+    testing.expectEqual(1, doc.styleSheets.length);
+    testing.expectEqual(style.sheet, doc.styleSheets[0]);
+    testing.expectEqual(parentCount, document.styleSheets.length);
+    iframe.remove();
+  });
+</script>
+<script id="children-change-normalize">
+{
+  const probe = document.createElement('div'); probe.id = 'lifecycle-normalize';
+  probe.style.cssText = 'width: 10px; height: 10px'; document.body.appendChild(probe);
+  const style = document.createElement('style');
+  style.append(document.createTextNode('#lifecycle-normalize { width: 25px !important }'),
+               document.createTextNode('#lifecycle-normalize { width: 75px !important }'));
+  document.head.appendChild(style);
+  testing.expectEqual(75, probe.getBoundingClientRect().width);
+  style.normalize();
+  testing.expectEqual(75, probe.getBoundingClientRect().width);
+  testing.expectEqual(2, style.sheet.cssRules.length);
+  testing.expectEqual('75px', style.sheet.cssRules[1].style.width);
+  style.remove(); probe.remove();
+}
+</script>
+<script id="children-change-state-preserving-move">
+{
+  const probe = document.createElement('div'); probe.id = 'lifecycle-move';
+  probe.style.cssText = 'width: 10px; height: 10px'; document.body.appendChild(probe);
+  const style = document.createElement('style'), last = document.createElement('style');
+  style.textContent = '#lifecycle-move { width: 25px !important }';
+  last.textContent = '#lifecycle-move { width: 50px !important }';
+  document.head.append(style, last);
+  const sheet = style.sheet, count = document.styleSheets.length;
+  sheet.insertRule('#lifecycle-move { width: 75px !important }', 1);
+  testing.expectEqual(50, probe.getBoundingClientRect().width);
+  document.head.moveBefore(style, null);
+  testing.expectEqual(sheet, style.sheet);
+  testing.expectEqual(2, style.sheet.cssRules.length);
+  testing.expectEqual('75px', style.sheet.cssRules[1].style.width);
+  testing.expectEqual(75, probe.getBoundingClientRect().width);
+  testing.expectEqual(last.sheet, document.styleSheets[count - 2]);
+  testing.expectEqual(sheet, document.styleSheets[count - 1]);
+  testing.expectEqual(count, document.styleSheets.length);
+  // Ordinary insertion is a remove + insert, not a state-preserving move.
+  document.head.insertBefore(style, last);
+  testing.expectTrue(sheet !== style.sheet);
+  testing.expectEqual(null, sheet.ownerNode);
+  testing.expectEqual(1, style.sheet.cssRules.length);
+  testing.expectEqual(50, probe.getBoundingClientRect().width);
+  const beforeDisconnect = style.sheet;
+  style.remove();
+  testing.expectEqual(null, beforeDisconnect.ownerNode);
+  document.head.appendChild(style);
+  testing.expectTrue(beforeDisconnect !== style.sheet);
+  testing.expectEqual(25, probe.getBoundingClientRect().width);
+  style.remove(); last.remove(); probe.remove();
+}
+</script>
+<script id="children-change-subtree-preserving-order">
+{
+  for (const preserve of [true]) {
+    const probe = document.createElement('div'); probe.id = 'lifecycle-subtree';
+    probe.style.cssText = 'width: 10px; height: 10px'; document.body.appendChild(probe);
+    const wrapper = document.createElement('div');
+    const a = document.createElement('style'), b = document.createElement('style'), c = document.createElement('style');
+    a.textContent = '#lifecycle-subtree { width: 25px !important }';
+    b.textContent = '.lifecycle-other { width: 35px }';
+    c.textContent = '#lifecycle-subtree { width: 50px !important }';
+    wrapper.append(a, b); document.head.append(wrapper, c);
+    const oldA = a.sheet, oldB = b.sheet, count = document.styleSheets.length;
+    testing.expectEqual(50, probe.getBoundingClientRect().width);
+    if (preserve) document.head.moveBefore(wrapper, null);
+    else document.head.appendChild(wrapper);
+    testing.expectEqual(25, probe.getBoundingClientRect().width);
+    testing.expectEqual(c.sheet, document.styleSheets[count - 3]);
+    testing.expectEqual(a.sheet, document.styleSheets[count - 2]);
+    testing.expectEqual(b.sheet, document.styleSheets[count - 1]);
+    testing.expectEqual(preserve, oldA === a.sheet);
+    testing.expectEqual(preserve, oldB === b.sheet);
+    testing.expectEqual(count, document.styleSheets.length);
+    wrapper.remove(); c.remove(); probe.remove();
+  }
+}
+</script>
+
+<script id="children-change-subtree-ordinary-order">
+{
+  for (const preserve of [false]) {
+    const probe = document.createElement('div'); probe.id = 'lifecycle-subtree';
+    probe.style.cssText = 'width: 10px; height: 10px'; document.body.appendChild(probe);
+    const wrapper = document.createElement('div');
+    const a = document.createElement('style'), b = document.createElement('style'), c = document.createElement('style');
+    a.textContent = '#lifecycle-subtree { width: 25px !important }';
+    b.textContent = '.lifecycle-other { width: 35px }';
+    c.textContent = '#lifecycle-subtree { width: 50px !important }';
+    wrapper.append(a, b); document.head.append(wrapper, c);
+    const oldA = a.sheet, oldB = b.sheet, count = document.styleSheets.length;
+    testing.expectEqual(50, probe.getBoundingClientRect().width);
+    if (preserve) document.head.moveBefore(wrapper, null);
+    else document.head.appendChild(wrapper);
+    testing.expectEqual(25, probe.getBoundingClientRect().width);
+    testing.expectEqual(c.sheet, document.styleSheets[count - 3]);
+    testing.expectEqual(a.sheet, document.styleSheets[count - 2]);
+    testing.expectEqual(b.sheet, document.styleSheets[count - 1]);
+    testing.expectEqual(preserve, oldA === a.sheet);
+    testing.expectEqual(preserve, oldB === b.sheet);
+    testing.expectEqual(count, document.styleSheets.length);
+    wrapper.remove(); c.remove(); probe.remove();
+  }
+}
+</script>

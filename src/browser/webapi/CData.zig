@@ -359,6 +359,7 @@ pub fn isEqualNode(self: *const CData, other: *const CData) bool {
 fn dataChanged(self: *CData, old: String, frame: *Frame) void {
     frame.styleChanged();
     Frame.observers.notifyCharacterDataChange(frame, self.asNode(), old);
+    if (self.asNode()._parent) |parent| frame.styleChildrenChanged(parent);
 }
 
 fn appendData(self: *CData, data: []const u8, frame: *Frame) !void {

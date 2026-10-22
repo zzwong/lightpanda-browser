@@ -2953,7 +2953,7 @@ pub fn nodeComplete(self: *Frame, node: *Node) !void {
         log.err(.bug, "build.complete", .{ .tag = node.getNodeName(self.local_arena), .err = err, .type = self._type, .url = self.url });
         return err;
     };
-    return self.nodeIsReady(true, node);
+    return self.nodeIsReady(true, node, false);
 }
 
 // Recursively sets the owner document for a node and all its descendants
@@ -3066,6 +3066,8 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
         observers.notifyChildListChange(self, parent, &.{}, &removed, previous_sibling, next_sibling);
     }
 
+    self.styleChildrenChanged(parent);
+
     if (opts.reconnect_to) |dest| {
         const dest_root = dest.getRootNode(.{});
         if (dest_root == old_root) {
@@ -3141,15 +3143,9 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
         // the one holding the sheet in its cascade.
         const sheet_owner = el.ownerFrame(self);
         if (el.is(Element.Html.Style)) |style| {
-            if (style._sheet) |sheet| {
-                removeStyleSheet(sheet_owner, sheet);
-                style._sheet = null;
-            }
-            // Unconditional: with no materialized sheet the manager still holds
-            // the rules it parsed straight from the element's text.
-            if (sheet_owner) |owner| {
-                owner._style_manager.sheetModified();
-            }
+            style.updateStyleBlock(self) catch |err| {
+                log.err(.frame, "style block removal", .{ .err = err });
+            };
         } else if (el.is(Element.Html.Link)) |link| {
             // External stylesheet links registered via Frame.loadExternalStylesheet
             // must be symmetrically deregistered on disconnect, or
@@ -3288,16 +3284,26 @@ pub fn moveAllChildren(self: *Frame, source: *Node, parent: *Node, ref_node: ?*N
     // node's own ready work runs, in tree order, with everything in place.
     // Ready work only happens on becoming connected, so a detached
     // destination has none.
+    self.styleChildrenChanged(parent);
     if (parent.isConnected()) {
         if (parent.is(Element.Html.Script)) |script| {
             if (!script._executed) {
-                try self.nodeIsReady(false, parent);
+                try self.nodeIsReady(false, parent, false);
             }
         }
         for (moved.items) |child| {
-            try self.nodeIsReadySubtree(child);
+            try self.nodeIsReadySubtree(child, false);
         }
     }
+}
+
+// DOM insert/remove/replace-data all run the parent's children-changed
+// steps. Parser insertions defer style processing until nodeComplete.
+pub fn styleChildrenChanged(self: *Frame, parent: *Node) void {
+    const style = parent.is(Element.Html.Style) orelse return;
+    style.updateStyleBlock(self) catch |err| {
+        log.err(.frame, "style children changed", .{ .err = err });
+    };
 }
 
 const InsertNodeRelative = union(enum) {
@@ -3317,6 +3323,8 @@ const InsertNodeOpts = struct {
     // the ready work itself once every node is in place, so an earlier
     // script observes its later siblings already inserted.
     run_ready: bool = true,
+    // moveBefore preserves the associated sheets, unlike ordinary insertion.
+    preserve_style_sheets: bool = false,
     // The parent's root (parser only, avoids having to look it up)
     parser_root: ?*Node = null,
 };
@@ -3436,6 +3444,7 @@ fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node, 
     if (opts.notify_observers) {
         self.notifyChildInserted(parent, child);
     }
+    if (opts.run_ready) self.styleChildrenChanged(parent);
 
     // Inserting into a not-yet-started script runs the script's
     // children-changed steps first, then the inserted nodes' own ready work
@@ -3445,13 +3454,13 @@ fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node, 
     if (opts.run_ready and parent_is_connected) {
         if (parent.is(Element.Html.Script)) |script| {
             if (!script._executed) {
-                try self.nodeIsReady(false, parent);
+                try self.nodeIsReady(false, parent, false);
             }
         }
 
         // nodeIsReady resolves the node's owning frame itself (only for the few node
         // types that have ready work), so pass the incumbent `self`.
-        try self.nodeIsReadySubtree(child);
+        try self.nodeIsReadySubtree(child, opts.preserve_style_sheets);
     }
 
     // nothing to register, and nothing can become connected.
@@ -3664,12 +3673,12 @@ fn updateRangesForNodeRemoval(self: *Frame, parent: *Node, child: *Node, child_i
 // Runs the "ready" work for an inserted node and, when it's an element with
 // children, for its descendants in tree order: appending a subtree
 // containing scripts must execute them all, after the whole insertion.
-fn nodeIsReadySubtree(self: *Frame, node: *Node) !void {
+fn nodeIsReadySubtree(self: *Frame, node: *Node, preserve_style_sheets: bool) !void {
     if (node._type != .element) {
-        return self.nodeIsReady(false, node);
+        return self.nodeIsReady(false, node, preserve_style_sheets);
     }
     if (node.firstChild() == null and node.as(Element).hostedShadowRoot(self) == null) {
-        return self.nodeIsReady(false, node);
+        return self.nodeIsReady(false, node, preserve_style_sheets);
     }
 
     // Scripts can mutate the tree. Safe to do this since nodeIsReady re-checks
@@ -3685,11 +3694,11 @@ fn nodeIsReadySubtree(self: *Frame, node: *Node) !void {
     }
     try self.collectShadowIFrames(&shadow_roots, &elements);
     for (elements.items) |el| {
-        try self.nodeIsReady(false, el);
+        try self.nodeIsReady(false, el, preserve_style_sheets);
     }
 }
 
-fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
+fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node, preserve_style_sheets: bool) !void {
     if ((comptime from_parser) and self._parse_mode == .fragment) {
         if (self._fragment_scripts_runnable == false) {
             // We don't execute scripts added via innerHTML = '<script...'. Mark
@@ -3767,7 +3776,7 @@ fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
         };
     } else if (node.is(Element.Html.Style)) |style| {
         const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
-        style.styleAddedCallback(frame) catch |err| {
+        style.styleAddedCallback(frame, preserve_style_sheets) catch |err| {
             log.debug(.frame, "frame.nodeIsReady", .{ .err = err, .element = "style", .type = frame._type });
             return error.StyleLoadError;
         };
