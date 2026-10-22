@@ -1224,3 +1224,55 @@ test "cdp.target: setAutoAttach without filter still sends startup attachedToTar
     try ctx.expectSentResult(null, .{ .id = 1, .index = 1 });
     try ctx.expectSentCount(2);
 }
+
+test "cdp.target: concurrent contexts enumerate distinct pages and preserve a survivor" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const cdp = ctx.cdp();
+    _ = try cdp.createBrowserContext();
+    const first = cdp.browser_contexts.items[0];
+    _ = try cdp.createBrowserContext();
+    const second = cdp.browser_contexts.items[1];
+    try ctx.processMessage(.{ .id = 1, .method = "Target.getBrowserContexts" });
+    try ctx.expectSentResult(.{ .browserContextIds = &[_][]const u8{ first.id, second.id } }, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank", .browserContextId = first.id } });
+    try ctx.processMessage(.{ .id = 3, .method = "Target.createTarget", .params = .{ .url = "about:blank", .browserContextId = second.id } });
+    try testing.expect(!std.mem.eql(u8, &first.target_id.?, &second.target_id.?));
+    try testing.expect(first.group_id != second.group_id);
+    try ctx.processMessage(.{ .id = 4, .method = "Target.getTargets" });
+    try ctx.expectSentResult(.{ .targetInfos = [_]TargetInfo{ pageTargetInfo(first).?, pageTargetInfo(second).? } }, .{ .id = 4 });
+    try ctx.processMessage(.{ .id = 5, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = first.id } });
+    try ctx.expectSentResult(null, .{ .id = 5 });
+    try testing.expectEqual(1, cdp.browser_contexts.items.len);
+    try testing.expect(cdp.browser_context.? == second);
+    try testing.expect(second.session.hasPage());
+    try testing.expect(second.mainFrame() != null);
+    cdp.reapContexts();
+    try ctx.processMessage(.{ .id = 6, .method = "Target.getBrowserContexts" });
+    try ctx.expectSentResult(.{ .browserContextIds = &[_][]const u8{second.id} }, .{ .id = 6 });
+}
+
+test "cdp.target: root storage and permission commands select their context" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const cdp = ctx.cdp();
+    _ = try cdp.createBrowserContext();
+    const first = cdp.browser_contexts.items[0];
+    _ = try cdp.createBrowserContext();
+    const second = cdp.browser_contexts.items[1];
+    try ctx.processMessage(.{ .id = 1, .method = "Storage.setCookies", .params = .{ .browserContextId = first.id, .cookies = &.{.{ .name = "owner", .value = "first", .url = "https://example.test/" }} } });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Storage.setCookies", .params = .{ .browserContextId = second.id, .cookies = &.{.{ .name = "owner", .value = "second", .url = "https://example.test/" }} } });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    try testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
+    try testing.expectEqualStrings("second", second.session.cookie_jar.cookies.items[0].value);
+    try ctx.processMessage(.{ .id = 3, .method = "Browser.grantPermissions", .params = .{ .browserContextId = second.id, .permissions = &[_][]const u8{"geolocation"} } });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+    try testing.expectEqual(null, first.session.permissions.get("geolocation"));
+    try testing.expectEqual(.granted, second.session.permissions.get("geolocation").?);
+    try ctx.processMessage(.{ .id = 4, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = second.id } });
+    try ctx.expectSentResult(null, .{ .id = 4 });
+    cdp.reapContexts();
+    try testing.expect(cdp.browser_context.? == first);
+    try testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
+}

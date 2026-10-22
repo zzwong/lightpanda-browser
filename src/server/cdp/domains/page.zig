@@ -1096,7 +1096,7 @@ fn captureScreenshot(cmd: *CDP.Command) !void {
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
-    const viewport = if (cmd.browser_context) |bc| bc.session.getViewport() else cmd.cdp.browser.getViewport();
+    const viewport = bc.session.getViewport();
 
     var opts: lp.screenshot.Opts = .fromViewport(viewport, params.captureBeyondViewport orelse false);
     if (params.clip) |clip| {

@@ -196,6 +196,15 @@ pub fn setViewportOverride(self: *Session, viewport: ?Viewport) void {
     for (self.pages.items) |page| page.viewportChanged();
 }
 
+// The client is borrowed and must outlive the session. Install it before
+// creating pages: their script managers retain the same client pointer.
+pub fn setHttpClient(self: *Session, client: *HttpClient) void {
+    lp.assert(self.pages.items.len == 0, "Session.setHttpClient with live pages", .{});
+    client.heartbeat_override = self.browser.http_client.watchdogHeartbeat();
+    client.driver = self.browser.http_client.driver;
+    self.http_client = client;
+}
+
 pub fn setPermission(self: *Session, name: []const u8, state: PermissionState) !void {
     const allocator = self.browser.allocator;
     const gop = try self.permissions.getOrPut(allocator, name);
@@ -1310,7 +1319,7 @@ test "Session: navigator reads its own network client" {
     var session: Session = undefined;
     try session.init(browser, notification);
     defer session.deinit();
-    session.http_client = &client;
+    session.setHttpClient(&client);
     const frame = (try session.createPage()).frame().?;
     const js = @import("js/js.zig");
     var scope: js.Local.Scope = undefined;
@@ -1318,4 +1327,8 @@ test "Session: navigator reads its own network client" {
     defer scope.deinit();
     try testing.expect((try scope.local.exec("navigator.userAgent === 'SessionBot/1.0' && navigator.language === 'fr-FR'", null)).toBool());
     try testing.expect(!std.mem.eql(u8, browser.http_client.getUserAgent(), "SessionBot/1.0"));
+    try testing.expect(client.watchdogHeartbeat() == browser.http_client.watchdogHeartbeat());
+    var page_runner = session.runner(.{});
+    _ = try page_runner.tickForFrame(frame._frame_id, 0, .{ .until = .done });
+    try testing.expect(client.watchdogHeartbeat().last_activity.load(.acquire) > 0);
 }

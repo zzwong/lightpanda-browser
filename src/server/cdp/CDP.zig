@@ -685,12 +685,10 @@ pub const BrowserContext = struct {
             session.http_client = &cdp.browser.http_client;
             self.http_client.deinit();
         }
-        self.http_client.driver = cdp.browser.http_client.driver;
-        self.http_client.heartbeat_override = &cdp.browser.http_client.heartbeat;
         self.http_client.http_version = cdp.browser.http_client.http_version;
         self.http_client.obey_robots = cdp.browser.http_client.obey_robots;
         self.http_client.tls_verify = cdp.browser.http_client.tls_verify;
-        session.http_client = &self.http_client;
+        session.setHttpClient(&self.http_client);
         self.node_search_list = Node.Search.List.init(allocator, &self.node_registry);
         errdefer self.node_search_list.deinit();
         errdefer self.intercept_state.deinit();
