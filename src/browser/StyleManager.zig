@@ -815,6 +815,12 @@ pub fn inlineSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis
     return length.resolve(self.frame.page.getViewport());
 }
 
+pub fn hasAutoWidth(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return false;
+    return self.geometryProps(el).width.unit == .auto;
+}
+
 pub const WidthSizing = union(enum) {
     fixed: f64, // A resolved length
     percent: f64, // A fraction of the containing block

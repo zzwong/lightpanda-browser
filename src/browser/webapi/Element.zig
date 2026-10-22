@@ -1876,11 +1876,12 @@ fn positionedClientRectAt(self: *Element, frame: *Frame, depth: u8) ?DOMRect.Dat
     const right = insets.right.resolve(containing.width, viewport);
     const top = insets.top.resolve(containing.height, viewport);
     const bottom = insets.bottom.resolve(containing.height, viewport);
-    const own_width = self.getElementAxis(frame, .width);
     const own_height = self.getElementAxis(frame, .height);
     var width = self.unpositionedBoxAxis(frame, .width);
     var height = self.unpositionedBoxAxis(frame, .height);
-    if (!own_width.explicit and left != null and right != null) width = @max(0, containing.width - left.? - right.?);
+    if (sm.hasAutoWidth(self) and left != null and right != null) {
+        width = self.clampWidth(@max(0, containing.width - left.? - right.?), .box, owner);
+    }
     if (!own_height.explicit and top != null and bottom != null) height = @max(0, containing.height - top.? - bottom.?);
     var translate_x: f64 = 0;
     if (left != null or right != null) {

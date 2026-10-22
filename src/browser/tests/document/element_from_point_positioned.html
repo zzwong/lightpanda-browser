@@ -38,6 +38,14 @@ testing.expectEqual(160, c.height);
 testing.expectEqual(258, child.clientWidth);
 testing.expectEqual(160, child.clientHeight);
 </script>
+<script id="inset_stretching_preserves_width_declarations_and_limits">
+child.style.cssText = 'position:absolute;left:10px;right:20px;width:50%;height:20px';
+testing.expectEqual(150, child.getBoundingClientRect().width);
+child.style.cssText = 'position:absolute;left:10px;right:20px;max-width:100px;height:20px';
+testing.expectEqual(100, child.getBoundingClientRect().width);
+child.style.cssText = 'position:absolute;left:10px;right:20px;max-width:100px;min-width:120px;height:20px';
+testing.expectEqual(120, child.getBoundingClientRect().width);
+</script>
 <script id="negative_and_percentage_insets">
 child.style.cssText = 'position:absolute;left:-20px;top:-10px;width:40px;height:20px';
 c = child.getBoundingClientRect();
