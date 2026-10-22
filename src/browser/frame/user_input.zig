@@ -2616,6 +2616,8 @@ test "user_input: shadow mouse rects are viewport relative and native clicks rea
     try testing.expectEqual(host_rect.y + 5, rect.y);
     const x = rect.x + 1;
     const y = rect.y + 1;
+    const public_hit = try ls.local.compileAndRun(try std.fmt.allocPrint(frame.local_arena, "document.elementFromPoint({d}, {d}) === document.getElementById('host')", .{ x, y }), null);
+    try testing.expect(public_hit.isTrue());
     try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
     try triggerMouseMove(frame, x, y);
     try triggerMousePress(frame, x, y, mouse_button.main, 1);
@@ -2637,6 +2639,8 @@ test "user_input: shadow mouse hit testing respects bounds and hidden descendant
     const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
     const rect = inner.boundingClientRectValues(frame);
     try testing.expect((try mouseHitTest(frame, rect.x, rect.y)).target == inner);
+    try testing.expect((try mouseHitTest(frame, rect.x + rect.width, rect.y + 1)).target == host);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x + rect.width + 1, rect.y + 1)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height + 1)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x - 1, rect.y + 1)).target == host);
@@ -2770,199 +2774,6 @@ test "user_input: shadow mouse wheel preserves outer scroll container" {
 }
 
 test "user_input: shadow mouse press and release on shadow siblings clicks the host" {
-    const page = try testing.pageTest("input_mouse_shadow.html", .{});
-    defer page.close();
-    const frame = page.frame().?;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    const other = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
-        \\const other = document.createElement('button');
-        \\other.style = 'width:50px;height:60px'; other.textContent = 'Other'; root.appendChild(other);
-        \\other.addEventListener('click', () => events.push({listener:'other'}));
-        \\other;
-    , null));
-    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
-    const start = inner.boundingClientRectValues(frame);
-    const end = other.boundingClientRectValues(frame);
-    try testing.expect((try mouseHitTest(frame, start.x + 1, start.y + 1)).target == inner);
-    try testing.expect((try mouseHitTest(frame, end.x + end.width - 1, end.y + 1)).target == other);
-    try triggerMousePress(frame, start.x + 1, start.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(frame, end.x + end.width - 1, end.y + 1, mouse_button.main, 1);
-    try testing.expect((try ls.local.compileAndRun("events.length === 1 && events[0].listener === 'host' && events[0].trusted", null)).isTrue());
-}
-
-test "user_input: retained fork shadow mouse rects are viewport relative and native clicks reach inner target" {
-    const page = try testing.pageTest("input_mouse_shadow.html", .{});
-    defer page.close();
-    const frame = page.frame().?;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    const host = frame.document.getElementById("host").?;
-    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
-    const host_rect = host.boundingClientRectValues(frame);
-    const rect = inner.boundingClientRectValues(frame);
-    try testing.expectEqual(host_rect.x + 20, rect.x);
-    try testing.expectEqual(host_rect.y + 5, rect.y);
-    const x = rect.x + 1;
-    const y = rect.y + 1;
-    const public_hit = try ls.local.compileAndRun(try std.fmt.allocPrint(frame.local_arena, "document.elementFromPoint({d}, {d}) === document.getElementById('host')", .{ x, y }), null);
-    try testing.expect(public_hit.isTrue());
-    try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
-    try triggerMouseMove(frame, x, y);
-    try triggerMousePress(frame, x, y, mouse_button.main, 1);
-    try triggerMouseRelease(frame, x, y, mouse_button.main, 1);
-    try testing.expect((try ls.local.compileAndRun(
-        \\events.length === 2 && events[0].listener === 'inner' && events[0].target === 'inner' &&
-        \\events[1].listener === 'host' && events[1].target === 'host' && events[1].inner && events.every(e => e.trusted)
-    , null)).isTrue());
-}
-
-test "user_input: retained fork shadow mouse hit testing respects bounds and hidden descendants" {
-    const page = try testing.pageTest("input_mouse_shadow.html", .{});
-    defer page.close();
-    const frame = page.frame().?;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    const host = frame.document.getElementById("host").?;
-    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
-    const rect = inner.boundingClientRectValues(frame);
-    try testing.expect((try mouseHitTest(frame, rect.x, rect.y)).target == inner);
-    try testing.expect((try mouseHitTest(frame, rect.x + rect.width, rect.y + 1)).target == host);
-    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height)).target == host);
-    try testing.expect((try mouseHitTest(frame, rect.x - 1, rect.y + 1)).target == host);
-    for ([_][]const u8{ "pointer-events:none", "visibility:hidden", "display:none" }) |style| {
-        try inner.setStyle(try std.fmt.allocPrint(frame.local_arena, "transform:translateX(20px);width:80px;height:60px;{s}", .{style}), frame);
-        try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
-    }
-    _ = try ls.local.compileAndRun(
-        \\root.innerHTML = '<div style="display:none"><button style="width:100px;height:100px">Hidden</button></div>';
-    , null);
-    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
-}
-
-test "user_input: retained fork shadow mouse nested closed roots and window scroll share coordinates" {
-    const page = try testing.pageTest("input_mouse_shadow.html", .{});
-    defer page.close();
-    const frame = page.frame().?;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    const target = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
-        \\root.innerHTML = '<div id="nested" style="transform:translateX(10px);width:150px;height:150px"></div>';
-        \\const nested = root.getElementById('nested');
-        \\const closedRoot = nested.attachShadow({mode:'closed'});
-        \\closedRoot.innerHTML = '<button id="deep" style="transform:translateX(15px);width:60px;height:40px">Deep</button>';
-        \\const deep = closedRoot.getElementById('deep');
-        \\window.deepClicks = 0;
-        \\deep.addEventListener('click', e => { if (e.isTrusted && e.target === deep) deepClicks++; });
-        \\deep;
-    , null));
-    const host = frame.document.getElementById("host").?;
-    const host_rect = host.boundingClientRectValues(frame);
-    const before = target.boundingClientRectValues(frame);
-    try testing.expectEqual(host_rect.x + 25, before.x);
-    try testing.expectEqual(host_rect.y + 10, before.y);
-    _ = try ls.local.compileAndRun("document.body.style.width = '3000px'; document.body.style.height = '3000px'; window.scrollTo(30, 10)", null);
-    const rect = target.boundingClientRectValues(frame);
-    try testing.expectEqual(before.x - 30, rect.x);
-    try testing.expectEqual(before.y - 10, rect.y);
-    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == target);
-    try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-    try testing.expect((try ls.local.compileAndRun("deepClicks === 1 && nested.shadowRoot === null", null)).isTrue());
-    _ = try ls.local.compileAndRun("nested.style.display = 'none'", null);
-    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
-}
-
-test "user_input: retained fork shadow mouse descendants can override inherited hit exclusions" {
-    const page = try testing.pageTest("input_mouse_shadow.html", .{});
-    defer page.close();
-    const frame = page.frame().?;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    const target = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
-        \\root.innerHTML = '<div style="pointer-events:none;visibility:hidden;width:150px;height:150px"><button id="enabled" style="pointer-events:auto;visibility:visible;width:60px;height:40px">Enabled</button></div>';
-        \\root.getElementById('enabled');
-    , null));
-    const rect = target.boundingClientRectValues(frame);
-    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == target);
-}
-
-test "user_input: retained fork shadow mouse keeps host boundary path and common click target" {
-    for ([_][]const u8{ "open", "closed" }) |mode| {
-        const page = try testing.pageTest("input_mouse_shadow.html", .{});
-        defer page.close();
-        const frame = page.frame().?;
-        var ls: js.Local.Scope = undefined;
-        frame.js.localScope(&ls);
-        defer ls.deinit();
-        _ = try ls.local.compileAndRun(try std.fmt.allocPrint(frame.local_arena, "window.boundaryMode = '{s}'", .{mode}), null);
-        const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
-            \\document.body.innerHTML = '<div id="boundaryHost" style="transform:translateX(80px);width:200px;height:200px"></div>';
-            \\const boundaryHost = document.getElementById('boundaryHost');
-            \\const boundaryRoot = boundaryHost.attachShadow({mode:boundaryMode});
-            \\boundaryRoot.innerHTML = '<button id="boundaryInner" style="transform:translateX(20px);width:80px;height:60px">Inner</button>';
-            \\const boundaryInner = boundaryRoot.getElementById('boundaryInner');
-            \\window.enters = []; window.leaves = []; window.clicks = [];
-            \\boundaryHost.addEventListener('mouseenter', () => enters.push('mouse'));
-            \\boundaryHost.addEventListener('pointerenter', () => enters.push('pointer'));
-            \\boundaryHost.addEventListener('mouseleave', () => leaves.push('mouse'));
-            \\boundaryHost.addEventListener('pointerleave', () => leaves.push('pointer'));
-            \\boundaryInner.addEventListener('click', e => clicks.push({where:'inner', target:e.target.id, trusted:e.isTrusted}));
-            \\boundaryHost.addEventListener('click', e => clicks.push({where:'host', target:e.target.id, trusted:e.isTrusted, inner:e.composedPath().includes(boundaryInner)}));
-            \\boundaryInner;
-        , null));
-        const host = frame.document.getElementById("boundaryHost").?;
-        const rect = inner.boundingClientRectValues(frame);
-        const host_rect = host.boundingClientRectValues(frame);
-        try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
-        try testing.expect((try ls.local.compileAndRun("enters.join(',') === 'pointer,mouse' && leaves.length === 0", null)).isTrue());
-        // Moving within the host does not leave or re-enter it.
-        try triggerMouseMove(frame, host_rect.x + 1, host_rect.y + 1);
-        try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
-        try testing.expect((try ls.local.compileAndRun("enters.length === 2 && leaves.length === 0", null)).isTrue());
-        try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-        try testing.expect((try ls.local.compileAndRun(
-            \\clicks.length === 2 && clicks[0].where === 'inner' && clicks[0].target === 'boundaryInner' &&
-            \\clicks[1].where === 'host' && clicks[1].target === 'boundaryHost' &&
-            \\clicks[1].inner === (boundaryMode === 'open') && clicks.every(e => e.trusted)
-        , null)).isTrue());
-        _ = try ls.local.compileAndRun("clicks = []", null);
-        try triggerMousePress(frame, host_rect.x + 1, host_rect.y + 1, mouse_button.main, 1);
-        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-        try testing.expect((try ls.local.compileAndRun("clicks.length === 1 && clicks[0].where === 'host' && clicks[0].trusted", null)).isTrue());
-        try triggerMouseMove(frame, -1, -1);
-        try testing.expect((try ls.local.compileAndRun("leaves.join(',') === 'pointer,mouse'", null)).isTrue());
-    }
-}
-
-test "user_input: retained fork shadow mouse wheel preserves outer scroll container" {
-    const page = try testing.pageTest("input_mouse_shadow.html", .{});
-    defer page.close();
-    const frame = page.frame().?;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
-        \\const scroller = document.createElement('div');
-        \\scroller.id = 'scroller'; scroller.style = 'overflow:auto;width:400px;height:100px';
-        \\host.before(scroller); scroller.appendChild(host);
-        \\inner;
-    , null));
-    const rect = inner.boundingClientRectValues(frame);
-    const scroller = frame.document.getElementById("scroller").?;
-    try testing.expect(scroller.getScrollHeight(frame) > scroller.getClientHeight(frame));
-    try triggerMouseWheel(frame, rect.x + 1, rect.y + 1, 0, 20);
-    try testing.expectEqual(@as(u32, 20), scroller.getScrollTop(frame));
-    try testing.expectEqual(@as(u32, 0), frame.window.getScrollY());
-}
-
-test "user_input: retained fork shadow mouse sibling release uses Element-only host fallback" {
     const page = try testing.pageTest("input_mouse_shadow.html", .{});
     defer page.close();
     const frame = page.frame().?;
