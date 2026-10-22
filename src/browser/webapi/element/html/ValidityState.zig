@@ -38,9 +38,9 @@ const ValidityState = @This();
 // because the flag definitions are per-type in the HTML spec.
 _owner: *Element,
 
-fn getValueMissing(self: *const ValidityState, frame: *Frame) bool {
+fn getValueMissing(self: *const ValidityState) bool {
     if (self.customFlags()) |flags| return flags.valueMissing;
-    if (self._owner.is(Input)) |input| return input.suffersValueMissing(frame);
+    if (self._owner.is(Input)) |input| return input.suffersValueMissing();
     if (self._owner.is(Select)) |select| return select.suffersValueMissing();
     if (self._owner.is(TextArea)) |textarea| return textarea.suffersValueMissing();
     return false;
@@ -111,7 +111,7 @@ fn getCustomError(self: *const ValidityState) bool {
 
 pub fn getValid(self: *const ValidityState, frame: *Frame) bool {
     if (self.customFlags()) |flags| return !flags.any();
-    return !self.getValueMissing(frame) and
+    return !self.getValueMissing() and
         !self.getTypeMismatch() and
         !self.getPatternMismatch(frame) and
         !self.getTooLong() and
@@ -169,7 +169,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ValidityState";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

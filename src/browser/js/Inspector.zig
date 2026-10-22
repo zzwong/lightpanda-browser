@@ -279,7 +279,7 @@ pub const Session = struct {
         local: *const js.Local,
         group: []const u8,
         value: anytype,
-    ) !RemoteObject {
+    ) !?RemoteObject {
         const js_val = try local.zigValueToJs(value, .{});
 
         // We do not want to expose this as a parameter for now
@@ -300,7 +300,7 @@ pub const Session = struct {
         val: *const v8.Value,
         grpname: []const u8,
         generatepreview: bool,
-    ) !RemoteObject {
+    ) ?RemoteObject {
         const remote_object = v8.v8_inspector__Session__wrapObject(
             self.handle,
             isolate,
@@ -309,7 +309,7 @@ pub const Session = struct {
             grpname.ptr,
             grpname.len,
             generatepreview,
-        ).?;
+        ) orelse return null; // not a context the inspector knows
         return .{ .handle = remote_object };
     }
 
@@ -357,7 +357,7 @@ const UnwrappedObject = struct {
     object_group: ?[]const u8,
 };
 
-pub fn getTaggedOpaque(value: *const v8.Value) ?*TaggedOpaque {
+pub fn getTaggedOpaque(value: *const v8.Value) ?TaggedOpaque {
     if (!v8.v8__Value__IsObject(value)) {
         return null;
     }

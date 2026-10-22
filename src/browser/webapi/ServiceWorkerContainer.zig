@@ -292,7 +292,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ServiceWorkerContainer";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -309,8 +308,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: ServiceWorker" {
-    // The throwing-worker and cross-origin cases log at error level on purpose.
-    testing.silenceLog(&.{ .http, .browser });
+    testing.expectLog(&.{.page_error});
     try testing.htmlRunner("service_worker/service_worker.html", .{
         .timeout_ms = 8000,
         .experimental_features = .{ .serviceworker = true },

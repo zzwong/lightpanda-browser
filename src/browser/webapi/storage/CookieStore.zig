@@ -520,7 +520,7 @@ fn storeCookie(exec: *const Execution, init_: CookieInit, is_delete: bool) !void
     };
 
     // CookieStore is a script API, so is_http = false.
-    try session.cookie_jar.add(cookie, lp.datetime.timestamp(.real), false);
+    try session.cookie_jar.addFromUrl(url, cookie, lp.datetime.timestamp(.real), false);
 }
 
 // Control characters (U+0000–U+001F and U+007F DEL) and `;` cannot appear in
@@ -540,7 +540,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "CookieStore";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

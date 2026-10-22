@@ -301,7 +301,7 @@ fn loadInitialScript(self: *ServiceWorkerGlobalScope, script: []const u8) !void 
             }
             js_context.page.recordJsError(err);
             const caught = try_catch.caughtOrError(self._script_load.?.arena.allocator(), err);
-            log.debug(.browser, "SWGS module error", .{ .url = url, .caught = caught });
+            log.warn(.page_error, "uncaught exception", .{ .url = url, .caught = caught });
             evaluated = false;
         };
     } else {
@@ -311,7 +311,7 @@ fn loadInitialScript(self: *ServiceWorkerGlobalScope, script: []const u8) !void 
             }
             js_context.page.recordJsError(err);
             const caught = try_catch.caughtOrError(self._script_load.?.arena.allocator(), err);
-            log.debug(.browser, "SWGS script error", .{ .url = url, .caught = caught });
+            log.warn(.page_error, "uncaught exception", .{ .url = url, .caught = caught });
             evaluated = false;
         };
     }
@@ -580,7 +580,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ServiceWorkerGlobalScope";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

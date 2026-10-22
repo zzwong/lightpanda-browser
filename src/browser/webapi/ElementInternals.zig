@@ -196,9 +196,9 @@ fn replaceFiles(self: *ElementInternals, files: []const *File, frame: *Frame) !v
     fl._files = dupe;
 }
 
-fn getForm(self: *const ElementInternals, frame: *Frame) !?*Form {
+fn getForm(self: *const ElementInternals) !?*Form {
     try self.assertFormAssociated();
-    return Form.ownerOf(self.asElement(), frame);
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *const ElementInternals, frame: *Frame) !js.Array {
@@ -300,7 +300,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ElementInternals";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

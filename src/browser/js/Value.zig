@@ -153,7 +153,25 @@ pub fn isArrayBuffer(self: Value) bool {
     return v8.v8__Value__IsArrayBuffer(self.handle);
 }
 
-pub fn taggedOpaque(self: Value) ?*const TaggedOpaque {
+pub fn isSharedArrayBuffer(self: Value) bool {
+    return v8.v8__Value__IsSharedArrayBuffer(self.handle);
+}
+
+/// Whether this converts to a WebIDL BufferSource: an ArrayBuffer, or a view
+/// onto one. Without [AllowShared], a SharedArrayBuffer, or a view onto one,
+/// doesn't.
+pub fn isBufferSource(self: Value) bool {
+    if (self.isArrayBuffer()) {
+        return true;
+    }
+    if (!self.isArrayBufferView()) {
+        return false;
+    }
+    const view: *const v8.ArrayBufferView = @ptrCast(self.handle);
+    return !js.arrayBufferIsShared(v8.v8__ArrayBufferView__Buffer(view).?);
+}
+
+pub fn taggedOpaque(self: Value) ?TaggedOpaque {
     // caller must ensure self.isObject()
     return TaggedOpaque.fromObject(@ptrCast(self.handle));
 }
@@ -506,11 +524,24 @@ const cloneable_types = .{
     @import("../webapi/DOMPoint.zig"),
     @import("../webapi/DOMRectReadOnly.zig"),
     @import("../webapi/DOMRect.zig"),
+    @import("../webapi/DOMException.zig"),
     @import("../webapi/webcodecs/encoded_chunk.zig").EncodedAudioChunk,
     @import("../webapi/webcodecs/encoded_chunk.zig").EncodedVideoChunk,
     @import("../webapi/webcodecs/AudioData.zig"),
     @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/CryptoKey.zig"),
 };
+
+comptime {
+    // writeHostObject relies on subtypes coming after their prototypes.
+    for (0..cloneable_types.len) |i| {
+        for (i + 1..cloneable_types.len) |j| {
+            if (bridge.inheritsOrIs(cloneable_types[i].JsApi, cloneable_types[j].JsApi)) {
+                @compileError(@typeName(cloneable_types[i]) ++ " must come after " ++ @typeName(cloneable_types[j]));
+            }
+        }
+    }
+}
 
 // Passed to a type's structuredSerialize hook to write its payload into the
 // V8 serialization buffer.
@@ -593,18 +624,12 @@ const CloneDelegate = struct {
             const obj = object orelse break :blk;
             const tao = TaggedOpaque.fromObject(obj) orelse break :blk;
 
-            const prototype_chain = tao.prototype_chain[0..tao.prototype_len];
-            if (writeCloneable(ctx, prototype_chain[0].index, tao.value)) |result| {
-                return result;
-            }
-
-            // Walk up the prototype chain so a subtype serializes as its
-            // closest cloneable supertype (mirrors TaggedOpaque.fromJS).
-            var ptr = @intFromPtr(tao.value);
-            for (prototype_chain[1..]) |proto| {
-                ptr -= proto.offset;
-                if (writeCloneable(ctx, proto.index, @ptrFromInt(ptr))) |result| {
-                    return result;
+            // Serialize as the closest cloneable type: subtypes are listed
+            // after their prototypes, so the last match is the closest.
+            inline for (0..cloneable_types.len) |i| {
+                const tag = cloneable_types.len - 1 - i;
+                if (tao.as(cloneable_types[tag])) |instance| {
+                    return writeCloneable(ctx, tag, instance);
                 }
             }
         }
@@ -613,24 +638,14 @@ const CloneDelegate = struct {
         return .{ .has_value = true, .value = false };
     }
 
-    fn writeCloneable(
-        ctx: *SerializeContext,
-        type_index: bridge.JsApiLookup.BackingInt,
-        value_ptr: *anyopaque,
-    ) ?v8.MaybeBool {
-        inline for (cloneable_types, 0..) |T, tag| {
-            if (type_index == bridge.JsApiLookup.getId(T.JsApi)) {
-                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
-                var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
-                const instance: *const T = @ptrCast(@alignCast(value_ptr));
-                instance.structuredSerialize(&writer) catch {
-                    throwDataCloneException(ctx.local, null);
-                    return .{ .has_value = true, .value = false };
-                };
-                return .{ .has_value = true, .value = true };
-            }
-        }
-        return null;
+    fn writeCloneable(ctx: *SerializeContext, tag: u32, instance: anytype) v8.MaybeBool {
+        v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
+        var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
+        instance.structuredSerialize(&writer) catch {
+            throwDataCloneException(ctx.local, null);
+            return .{ .has_value = true, .value = false };
+        };
+        return .{ .has_value = true, .value = true };
     }
 
     // Called by V8 to read back what writeHostObject wrote. Returning null
@@ -902,13 +917,14 @@ const Inert = struct {
 
         fn ownDataProperty(self: *State, object: *const v8.Object, key: []const u8) ?*const v8.Value {
             const local = self.local;
-            const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(object, local.handle, local.isolate.initStringHandle(key)) orelse return null;
+            const key_handle = local.isolate.initStringHandle(key) catch return null;
+            const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(object, local.handle, key_handle) orelse return null;
             if (v8.v8__Value__IsObject(descriptor) == false) {
                 return null;
             }
 
             // An accessor descriptor has no own `value`, and a Get would then reach Object.prototype.
-            const value_key = local.isolate.initStringHandle("value");
+            const value_key = local.isolate.initStringHandle("value") catch return null;
             var has: v8.MaybeBool = undefined;
             v8.v8__Object__HasOwnProperty(@ptrCast(descriptor), local.handle, value_key, &has);
             if (has.has_value == false or has.value == false) {

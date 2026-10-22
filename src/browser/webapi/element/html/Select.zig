@@ -305,6 +305,17 @@ pub fn setValue(self: *Select, value: []const u8, frame: *Frame) !void {
     frame.domChanged();
 }
 
+/// The position of `option` in the list of options, or null when the option
+/// is not in it.
+pub fn optionIndex(self: *const Select, option: *const Option) ?u32 {
+    var index: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |o| : (index += 1) {
+        if (o == option) return index;
+    }
+    return null;
+}
+
 pub fn getSelectedIndex(self: *Select) i32 {
     var index: i32 = 0;
     var it = OptionIterator.init(self);
@@ -443,8 +454,8 @@ pub fn getSelectedOptions(self: *Select, frame: *Frame) !collections.NodeLive(.s
     return collections.NodeLive(.selected_options).init(self.asNode(), {}, frame);
 }
 
-pub fn getForm(self: *Select, frame: *Frame) ?*Form {
-    return Form.ownerOf(self.asElement(), frame);
+pub fn getForm(self: *Select) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *Select, frame: *Frame) !js.Array {
@@ -519,7 +530,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLSelectElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

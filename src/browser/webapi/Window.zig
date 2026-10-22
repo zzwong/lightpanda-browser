@@ -19,9 +19,12 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+const Notification = @import("../../Notification.zig");
+
 const js = @import("../js/js.zig");
 const URL = @import("../URL.zig");
 const Frame = @import("../Frame.zig");
+
 const Console = @import("Console.zig");
 const History = @import("History.zig");
 const Navigation = @import("navigation/Navigation.zig");
@@ -51,7 +54,7 @@ const CustomElementRegistry = @import("CustomElementRegistry.zig");
 const Selection = @import("Selection.zig");
 const Timers = @import("Timers.zig");
 const Scheduler = @import("Scheduler.zig");
-const Notification = @import("../../Notification.zig");
+const global_event_handlers = @import("global_event_handlers.zig");
 
 const log = lp.log;
 
@@ -82,7 +85,7 @@ _caches: ?*CacheStorage = null,
 _reporting_error: bool = false,
 _current_event: ?*Event = null,
 _location: *Location,
-_history: History = .{},
+_history: History,
 _timers: Timers = .{},
 _scheduler: Scheduler = .{},
 _custom_elements: CustomElementRegistry = .{},
@@ -215,6 +218,30 @@ fn setInnerHeight(self: *Window, value: js.Value) void {
 
 fn setDevicePixelRatio(self: *Window, value: js.Value) void {
     self.replaceGlobalProperty(value, "devicePixelRatio");
+}
+
+fn setOuterWidth(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "outerWidth");
+}
+
+fn setOuterHeight(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "outerHeight");
+}
+
+fn setScreenX(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenX");
+}
+
+fn setScreenY(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenY");
+}
+
+fn setScreenLeft(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenLeft");
+}
+
+fn setScreenTop(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenTop");
 }
 
 fn setScrollX(self: *Window, value: js.Value) void {
@@ -366,15 +393,16 @@ pub fn getCustomElements(self: *Window) *CustomElementRegistry {
     return &self._custom_elements;
 }
 
-// The "window-reflecting body element event handler set" (HTML spec): these
-// event handlers of body and frameset elements are aliases for the Window's.
+// The event handlers of body and frameset elements that are aliases for the
+// Window's: the "window-reflecting body element event handler set" plus
+// WindowEventHandlers (HTML spec, "determining the target of an event handler").
 pub fn isWindowReflectingHandler(name: []const u8) bool {
     inline for (.{ "onblur", "onerror", "onfocus", "onload", "onresize", "onscroll" }) |n| {
         if (std.mem.eql(u8, name, n)) {
             return true;
         }
     }
-    return false;
+    return global_event_handlers.isWindowEventHandler(name);
 }
 
 // Accessor for a window-reflecting event handler (i.e. body or frameset)..
@@ -397,20 +425,20 @@ pub fn fetch(_: *const Window, input: Fetch.Input, options: ?Fetch.InitOpts, exe
     return Fetch.init(input, options, exec);
 }
 
-pub fn setTimeout(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []js.Value.Global, exec: *js.Execution) !u32 {
+pub fn setTimeout(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: js.Variadic(js.Value.Global), exec: *js.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = false,
-        .params = params,
+        .params = params.values,
         .name = "window.setTimeout",
     });
 }
 
-pub fn setInterval(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []js.Value.Global, exec: *js.Execution) !u32 {
+pub fn setInterval(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: js.Variadic(js.Value.Global), exec: *js.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = true,
-        .params = params,
+        .params = params.values,
         .name = "window.setInterval",
     });
 }
@@ -474,17 +502,19 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
     defer frame.js.call_depth = call_depth;
 
     frame.page.recordJsError(error.JsException);
+    frame.page.status.noteException(err.toStringSlice() catch "");
 
     const location = err.errorLocation(frame.call_arena) catch js.Value.ErrorLocation{};
 
     const target = self.asEventTarget();
     if (!frame._event_manager.hasDirectListeners(target, "error")) {
-        if (comptime lp.IS_TEST == false) {
-            log.debug(.js, "window.reportError", .{
-                .message = err.toStringSlice() catch "Unknown error",
-            });
-        }
-        notifyExceptionThrown(err, location, frame);
+        log.warn(.page_error, "uncaught exception", .{
+            .message = err.toStringSlice() catch "Unknown error",
+            .url = location.url,
+            .line = location.line,
+            .column = location.column,
+        });
+        notifyExceptionThrown(err, location, .exception, frame);
         return;
     }
 
@@ -511,28 +541,26 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
         .run_microtasks = false,
     });
 
-    if (comptime lp.IS_TEST == false) {
-        if (!event._prevent_default) {
-            log.debug(.js, "window.reportError", .{
-                .message = error_event._message,
-                .filename = error_event._filename,
-                .line_number = error_event._line_number,
-                .column_number = error_event._column_number,
-            });
-        }
-    }
     if (!event._prevent_default) {
-        notifyExceptionThrown(err, location, frame);
+        log.warn(.page_error, "uncaught exception", .{
+            .message = error_event._message,
+            .url = error_event._filename,
+            .line = error_event._line_number,
+            .column = error_event._column_number,
+        });
+        notifyExceptionThrown(err, location, .exception, frame);
     }
 }
 
-// An error event left uncancelled leaves the exception "uncaught": CDP
-// clients learn about it through Runtime.exceptionThrown.
-fn notifyExceptionThrown(err: js.Value, location: js.Value.ErrorLocation, frame: *Frame) void {
+// An error event (or unhandledrejection event) left uncancelled leaves the
+// exception "uncaught": CDP clients learn about it through
+// Runtime.exceptionThrown.
+pub fn notifyExceptionThrown(err: js.Value, location: js.Value.ErrorLocation, kind: @FieldType(Notification.ExceptionThrown, "kind"), frame: *Frame) void {
     frame._session.notification.dispatch(.exception_thrown, &.{
         .timestamp = lp.datetime.timestamp(.boot),
         .value = err,
         .location = location,
+        .kind = kind,
     });
 }
 
@@ -777,6 +805,20 @@ fn getDevicePixelRatio(_: *const Window, frame: *Frame) f32 {
     return frame.page.getViewport().scale;
 }
 
+// There is no window frame around the viewport and no window position on a
+// screen, so the outer size is the viewport and the position is 0.
+fn getOuterWidth(_: *const Window, frame: *Frame) u32 {
+    return frame.page.getViewport().width;
+}
+
+fn getOuterHeight(_: *const Window, frame: *Frame) u32 {
+    return frame.page.getViewport().height;
+}
+
+fn getScreenPosition(_: *const Window) i32 {
+    return 0;
+}
+
 pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Frame) !void {
     const o = opts.offsets(y);
     const size = self._frame.document.scrollSize();
@@ -864,29 +906,29 @@ fn getWebDriver(_: *const Window) @import("WebDriver.zig") {
     return .{};
 }
 
-pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, rejection: js.PromiseRejection, frame: *Frame) !void {
-    if (comptime lp.IS_DEBUG) {
-        log.debug(.js, "unhandled rejection", .{
-            .target = "window",
-            .value = rejection.reason(),
-            .stack = rejection.local.stackTrace() catch |err| @errorName(err) orelse "???",
-        });
-    }
-
+// "unhandledrejection" for a promise still rejected without a handler at the
+// end of a microtask checkpoint, "rejectionhandled" for one that got a handler
+// after that. Env.reportRejectedPromises reports an "unhandledrejection" the
+// page doesn't cancel. Returns whether the event was cancelled.
+pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, promise: js.Promise, reason: ?js.Value, frame: *Frame) !bool {
     const event_name = if (no_handler) "unhandledrejection" else "rejectionhandled";
 
-    if (no_handler) {
-        frame.page.recordJsError(error.JsException);
+    const target = self.asEventTarget();
+    if (!frame._event_manager.hasDirectListeners(target, event_name)) {
+        return false;
     }
 
-    const target = self.asEventTarget();
-    if (frame._event_manager.hasDirectListeners(target, event_name)) {
-        const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
-            .reason = if (rejection.reason()) |r| try r.persist() else null,
-            .promise = try rejection.promise().persist(),
-        }, frame.page)).asEvent();
-        try frame._event_manager.dispatchDirect(target, event, .{ .context = "window.unhandledrejection" });
-    }
+    const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
+        .reason = if (reason) |r| try r.persist() else null,
+        .promise = try promise.persist(),
+        .cancelable = no_handler,
+    }, frame.page)).asEvent();
+    // Keep the event alive past dispatch so we can read _prevent_default.
+    event.acquireRef();
+    defer event.releaseRef(frame.page);
+
+    try frame._event_manager.dispatchDirect(target, event, .{ .context = "window.unhandledrejection" });
+    return event._prevent_default;
 }
 
 // Some properties are readonly but [Replaceable]. They get assigned as own
@@ -985,7 +1027,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Window";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -1102,13 +1143,24 @@ pub const JsApi = struct {
     pub const onvolumechange = EventTarget.handlerAccessor(Window, "volumechange");
     pub const onwaiting = EventTarget.handlerAccessor(Window, "waiting");
     pub const onwheel = EventTarget.handlerAccessor(Window, "wheel");
-    // WindowEventHandlers
+    pub const onafterprint = EventTarget.handlerAccessor(Window, "afterprint");
+    pub const onbeforeprint = EventTarget.handlerAccessor(Window, "beforeprint");
+    pub const onbeforeunload = EventTarget.handlerAccessor(Window, "beforeunload");
     pub const onhashchange = EventTarget.handlerAccessor(Window, "hashchange");
+    pub const onlanguagechange = EventTarget.handlerAccessor(Window, "languagechange");
     pub const onmessage = EventTarget.handlerAccessor(Window, "message");
+    pub const onmessageerror = EventTarget.handlerAccessor(Window, "messageerror");
+    pub const onoffline = EventTarget.handlerAccessor(Window, "offline");
+    pub const ononline = EventTarget.handlerAccessor(Window, "online");
+    pub const onpagehide = EventTarget.handlerAccessor(Window, "pagehide");
+    pub const onpagereveal = EventTarget.handlerAccessor(Window, "pagereveal");
     pub const onpageshow = EventTarget.handlerAccessor(Window, "pageshow");
+    pub const onpageswap = EventTarget.handlerAccessor(Window, "pageswap");
     pub const onpopstate = EventTarget.handlerAccessor(Window, "popstate");
     pub const onrejectionhandled = EventTarget.handlerAccessor(Window, "rejectionhandled");
+    pub const onstorage = EventTarget.handlerAccessor(Window, "storage");
     pub const onunhandledrejection = EventTarget.handlerAccessor(Window, "unhandledrejection");
+    pub const onunload = EventTarget.handlerAccessor(Window, "unload");
     pub const event = bridge.accessor(Window.getEvent, Window.setEvent, .{ .null_as_undefined = true });
     pub const fetch = bridge.function(Window.fetch, .{});
     pub const queueMicrotask = bridge.function(Window.queueMicrotask, .{});
@@ -1149,6 +1201,12 @@ pub const JsApi = struct {
     pub const innerWidth = bridge.accessor(Window.getInnerWidth, Window.setInnerWidth, .{});
     pub const innerHeight = bridge.accessor(Window.getInnerHeight, Window.setInnerHeight, .{});
     pub const devicePixelRatio = bridge.accessor(Window.getDevicePixelRatio, Window.setDevicePixelRatio, .{});
+    pub const outerWidth = bridge.accessor(Window.getOuterWidth, Window.setOuterWidth, .{});
+    pub const outerHeight = bridge.accessor(Window.getOuterHeight, Window.setOuterHeight, .{});
+    pub const screenX = bridge.accessor(Window.getScreenPosition, Window.setScreenX, .{});
+    pub const screenY = bridge.accessor(Window.getScreenPosition, Window.setScreenY, .{});
+    pub const screenLeft = bridge.accessor(Window.getScreenPosition, Window.setScreenLeft, .{});
+    pub const screenTop = bridge.accessor(Window.getScreenPosition, Window.setScreenTop, .{});
 
     pub const opener = bridge.accessor(Window.getOpener, Window.setOpener, .{});
     pub const closed = bridge.accessor(Window.getClosed, null, .{});
@@ -1254,7 +1312,6 @@ const CrossOriginWindow = struct {
 
         pub const Meta = struct {
             pub const name = "CrossOriginWindow";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 

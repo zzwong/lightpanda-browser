@@ -273,7 +273,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ReadableStreamDefaultController";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -317,7 +316,8 @@ test "ReadableStreamDefaultController: chunks and pending reads release their gl
         \\}
         \\{
         \\  let c;
-        \\  new ReadableStream({ start(ctrl) { c = ctrl; } }).getReader().read();
+        \\  // handled, so the rejection isn't held until a microtask checkpoint
+        \\  new ReadableStream({ start(ctrl) { c = ctrl; } }).getReader().read().catch(() => {});
         \\  c.error('boom');
         \\}
         \\{

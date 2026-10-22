@@ -140,7 +140,7 @@ fn markAborted(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !vo
         // Allocate the DOMException so the reason keeps a single JS identity:
         // dependent signals must expose the very same DOMException instance.
         const dom = try exec.page_arena.create(DOMException);
-        dom.* = DOMException.fromError(error.AbortError).?;
+        dom.* = defaultReason();
         self._reason = .{ .dom = dom };
     }
 
@@ -191,12 +191,7 @@ fn createAborted(reason_: ?js.Value, exec: *const Execution) !*AbortSignal {
     return signal;
 }
 
-fn createAny(signals_value: js.Value, exec: *const Execution) !*AbortSignal {
-    // The parameter isn't optional. If we declared it as a slice directy, the
-    // bridge would treat it as a variadic and map it to empty rather than throwing
-    // a TypeError as it should.
-    const signals = try signals_value.toZig([]const *AbortSignal);
-
+fn createAny(signals: []const *AbortSignal, exec: *const Execution) !*AbortSignal {
     const result = try init(exec);
     for (signals) |source| {
         if (source._aborted) {
@@ -256,11 +251,16 @@ fn throwIfAborted(self: *const AbortSignal, exec: *const Execution) !ThrowIfAbor
             .dom => |err| local.newException(err),
             .string => |str| local.newException(str),
             .js_val => |js_val| local.newException(js_val),
-            .undefined => local.newException(DOMException.fromError(error.AbortError).?),
+            .undefined => local.newException(defaultReason()),
         };
         return .{ .exception = exception };
     }
     return .undefined;
+}
+
+// The reason for an abort without one. The message matches Chrome's.
+fn defaultReason() DOMException {
+    return .init("signal is aborted without reason", "AbortError");
 }
 
 pub const Reason = union(enum) {
@@ -276,7 +276,7 @@ pub fn reasonJsValue(reason: Reason, local: *const js.Local) !js.Value {
         .dom => |dom| local.zigValueToJs(dom, .{}),
         .string => |str| local.zigValueToJs(str, .{}),
         .js_val => |global| local.toLocal(global),
-        .undefined => local.zigValueToJs(DOMException.fromError(error.AbortError).?, .{}),
+        .undefined => local.zigValueToJs(defaultReason(), .{}),
     };
 }
 
@@ -310,7 +310,7 @@ const TimeoutCallback = struct {
         }
 
         const dom = try self.exec.page_arena.create(DOMException);
-        dom.* = DOMException.fromError(error.TimeoutError).?;
+        dom.* = DOMException.init("signal timed out", "TimeoutError");
         try self.signal.abort(.{ .dom = dom }, self.exec);
     }
 };
@@ -321,7 +321,6 @@ pub const JsApi = struct {
     pub const Meta = struct {
         pub const name = "AbortSignal";
 
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

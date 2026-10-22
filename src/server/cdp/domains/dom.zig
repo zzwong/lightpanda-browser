@@ -374,7 +374,7 @@ fn resolveNode(cmd: *CDP.Command) !void {
         &ls.local,
         params.objectGroup orelse "",
         node.dom,
-    );
+    ) orelse return error.ContextNotFound;
     defer remote_object.deinit();
 
     const arena = cmd.arena;
@@ -455,6 +455,17 @@ const BoxModel = struct {
     height: i32,
     // shapeOutside: ?ShapeOutsideInfo,
 };
+
+// Like Chrome, positions are in the top-level viewport: a node inside an
+// iframe is offset by where its frame sits.
+fn viewportRect(element: *DOMNode.Element, frame: *Frame) DOMNode.Element.DOMRect.Data {
+    var rect = element.boundingClientRectValues(frame);
+    const owner = element.ownerFrame(frame) orelse return rect;
+    const point = Frame.user_input.pointInFrame(owner, frame, rect.x, rect.y);
+    rect.x = point.x;
+    rect.y = point.y;
+    return rect;
+}
 
 fn rectToQuad(rect: DOMNode.Element.DOMRect.Data) Quad {
     return Quad{
@@ -545,7 +556,7 @@ fn getContentQuads(cmd: *CDP.Command) !void {
     // Text may be tricky, multiple quads in case of multiple lines? empty quads of text  = ""?
     // Elements like SVGElement may have multiple quads.
 
-    const quad = rectToQuad(element.boundingClientRectValues(frame));
+    const quad = rectToQuad(viewportRect(element, frame));
     return cmd.sendResult(.{ .quads = &.{quad} }, .{});
 }
 
@@ -566,7 +577,7 @@ fn getBoxModel(cmd: *CDP.Command) !void {
 
     // Without padding, border or margin in the layout, the four boxes coincide.
     // Drivers read `border` for boundingBox(), so it must not be zero.
-    const rect = element.boundingClientRectValues(frame);
+    const rect = viewportRect(element, frame);
     const quad = rectToQuad(rect);
 
     return cmd.sendResult(.{ .model = BoxModel{
@@ -1205,8 +1216,8 @@ test "cdp.dom: focus and setFileInputFiles fire in the node's own frame" {
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/input_iframe.html" });
     const child = bc.mainFrame().?.child_frames.items[0];
 
-    const text = child.document.getElementById("text", child) orelse unreachable;
-    const upload = child.document.getElementById("upload", child) orelse unreachable;
+    const text = child.document.getElementById("text") orelse unreachable;
+    const upload = child.document.getElementById("upload") orelse unreachable;
     const text_node = try bc.node_registry.register(text.asNode());
     const upload_node = try bc.node_registry.register(upload.asNode());
 
@@ -1510,6 +1521,43 @@ fn sentObjectId(ctx: *testing.TestContext, msg_id: i64) ![]const u8 {
     return error.MessageNotFound;
 }
 
+test "cdp.dom: getContentQuads of a node in a nested iframe is in the top-level viewport" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .url = "input_mouse_frames.html" });
+    const main = bc.mainFrame().?;
+    const child = main.child_frames.items[0];
+    const nested = child.child_frames.items[0];
+    const inner = nested.document.getElementById("inner").?;
+    const inner_rect = inner.boundingClientRectValues(nested);
+    const child_rect = child.iframe.?.asElement().boundingClientRectValues(main);
+    const nested_rect = nested.iframe.?.asElement().boundingClientRectValues(child);
+    const x = inner_rect.x + nested_rect.x + child_rect.x;
+    const y = inner_rect.y + nested_rect.y + child_rect.y;
+
+    const node = try bc.node_registry.register(inner.asNode());
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "DOM.getContentQuads",
+        .params = .{ .nodeId = node.id },
+    });
+    const right = x + inner_rect.width;
+    const bottom = y + inner_rect.height;
+    try ctx.expectSentResult(.{ .quads = &[_]Quad{.{ x, y, right, y, right, bottom, x, bottom }} }, .{ .id = 1 });
+
+    // What a driver does next: click the quad's center.
+    var ls: js.Local.Scope = undefined;
+    nested.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("window.clicked = false; document.getElementById('inner').addEventListener('click', () => clicked = true);", null);
+    const cx = x + inner_rect.width / 2;
+    const cy = y + inner_rect.height / 2;
+    try ctx.processMessage(.{ .id = 2, .method = "Input.dispatchMouseEvent", .params = .{ .type = "mousePressed", .x = cx, .y = cy, .button = "left", .clickCount = 1 } });
+    try ctx.processMessage(.{ .id = 3, .method = "Input.dispatchMouseEvent", .params = .{ .type = "mouseReleased", .x = cx, .y = cy, .button = "left", .clickCount = 1 } });
+    try testing.expect((try ls.local.compileAndRun("clicked", null)).isTrue());
+}
+
 test "cdp.dom: getBoxModel" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -1536,12 +1584,13 @@ test "cdp.dom: getBoxModel" {
         .method = "DOM.getBoxModel",
         .params = .{ .nodeId = 3 },
     });
+    // A block in normal flow is as wide as the body.
     try ctx.expectSentResult(.{ .model = BoxModel{
-        .content = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .padding = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .border = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .margin = Quad{ 0.0, 25.0, 5.0, 25.0, 5.0, 30.0, 0.0, 30.0 },
-        .width = 5,
+        .content = Quad{ 0.0, 25.0, 1920.0, 25.0, 1920.0, 30.0, 0.0, 30.0 },
+        .padding = Quad{ 0.0, 25.0, 1920.0, 25.0, 1920.0, 30.0, 0.0, 30.0 },
+        .border = Quad{ 0.0, 25.0, 1920.0, 25.0, 1920.0, 30.0, 0.0, 30.0 },
+        .margin = Quad{ 0.0, 25.0, 1920.0, 25.0, 1920.0, 30.0, 0.0, 30.0 },
+        .width = 1920,
         .height = 5,
     } }, .{ .id = 5 });
 }

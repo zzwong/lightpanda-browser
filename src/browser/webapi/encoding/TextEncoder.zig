@@ -31,9 +31,9 @@ pub fn encode(_: *const TextEncoder, v_: ?js.Value, exec: *const js.Execution) !
     // The input is an optional USVString defaulting to "": undefined is the
     // default, anything else (null included) is stringified.
     const source = blk: {
-        const v = v_ orelse break :blk local.newString("");
+        const v = v_ orelse break :blk try local.newString("");
         if (v.isUndefined()) {
-            break :blk local.newString("");
+            break :blk try local.newString("");
         }
         break :blk try v.toString();
     };
@@ -77,7 +77,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "TextEncoder";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
         pub const empty_with_no_proto = true;
     };

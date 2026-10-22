@@ -339,7 +339,6 @@ pub const JsApi = struct {
     pub const Meta = struct {
         pub const name = "CustomElementRegistry";
         pub var class_id: bridge.ClassId = undefined;
-        pub const prototype_chain = bridge.prototypeChain();
     };
 
     pub const define = bridge.function(CustomElementRegistry.define, .{ .ce_reactions = true });
@@ -351,5 +350,13 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: CustomElementRegistry" {
+    if (comptime lp.IS_DEBUG) {
+        // Our reaction stack is per frame. The test opens the scope in the
+        // caller's frame, but attributeChange queues the reaction on the
+        // element's frame. When those differ, the reaction goes into the
+        // backup queue. We should probably move it from the Frame to the Page.
+        // this only logs in debug
+        testing.expectLog(&.{ .bug, .bug, .bug });
+    }
     try testing.htmlRunner("custom_elements", .{});
 }

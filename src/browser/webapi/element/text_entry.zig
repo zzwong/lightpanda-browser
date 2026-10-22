@@ -23,6 +23,7 @@ const std = @import("std");
 
 const Frame = @import("../../Frame.zig");
 
+const CData = @import("../CData.zig");
 const Event = @import("../Event.zig");
 const Selection = @import("../Selection.zig");
 const InputEvent = @import("../event/InputEvent.zig");
@@ -274,11 +275,22 @@ pub fn TextEntry(comptime T: type) type {
             return @tagName(self._selection_direction);
         }
 
+        // Selection offsets are kept as byte offsets into the UTF-8 value, while
+        // the JS API counts UTF-16 code units.
+        pub fn selectionOffsetToJs(self: *const T, offset: u32) u32 {
+            const value = self.getValue();
+            return @intCast(CData.utf16Len(value[0..@min(offset, value.len)]));
+        }
+
+        fn selectionOffsetFromJs(self: *const T, offset: u32) u32 {
+            return @intCast(CData.utf16OffsetToUtf8Floor(self.getValue(), offset));
+        }
+
         pub fn setSelectionStart(self: *T, value: u32, frame: *Frame) !void {
             if (self.selectionAvailable() == false) {
                 return error.InvalidStateError;
             }
-            self._selection_start = value;
+            self._selection_start = selectionOffsetFromJs(self, value);
             try dispatchSelectionChangeEvent(self, frame);
         }
 
@@ -286,7 +298,7 @@ pub fn TextEntry(comptime T: type) type {
             if (self.selectionAvailable() == false) {
                 return error.InvalidStateError;
             }
-            self._selection_end = value;
+            self._selection_end = selectionOffsetFromJs(self, value);
             try dispatchSelectionChangeEvent(self, frame);
         }
 
@@ -307,7 +319,96 @@ pub fn TextEntry(comptime T: type) type {
                 } else break :blk .none;
             };
 
-            return applySelectionRange(self, selection_start, selection_end, direction, frame);
+            return applySelectionRange(self, selectionOffsetFromJs(self, selection_start), selectionOffsetFromJs(self, selection_end), direction, frame);
+        }
+
+        const SelectionMode = enum { select, start, end, preserve };
+
+        // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext
+        pub fn setRangeText(
+            self: *T,
+            replacement: []const u8,
+            range_start: ?u32,
+            range_end: ?u32,
+            selection_mode: ?[]const u8,
+            frame: *Frame,
+        ) !void {
+            // Argument errors come first: Chrome throws them while converting
+            // the arguments. A start needs an end.
+            const mode: SelectionMode = if (selection_mode) |m|
+                std.meta.stringToEnum(SelectionMode, m) orelse return error.TypeError
+            else
+                .preserve;
+            if (range_start != null and range_end == null) {
+                return error.TypeError;
+            }
+
+            if (self.selectionAvailable() == false) {
+                return error.InvalidStateError;
+            }
+
+            // Offsets are in UTF-16 code units, like the spec, and only become
+            // byte offsets against a given value: setValue can sanitize the new
+            // one (newlines, CRLF), so its byte offsets differ from the concat's.
+            const value = self.getValue();
+            const value_len: u32 = @intCast(CData.utf16Len(value));
+            const sel_start = selectionOffsetToJs(self, self._selection_start);
+            const sel_end = selectionOffsetToJs(self, self._selection_end);
+
+            // setRangeText(replacement) replaces the selection
+            var start = sel_start;
+            var end = sel_end;
+            if (range_start) |js_start| {
+                const js_end = range_end.?;
+                if (js_start > js_end) {
+                    return error.IndexSizeError;
+                }
+                start = @min(js_start, value_len);
+                end = @min(js_end, value_len);
+            }
+
+            {
+                const byte_start = selectionOffsetFromJs(self, start);
+                const byte_end = selectionOffsetFromJs(self, end);
+                const scratch = try frame.getArena(value.len + replacement.len, "TextEntry.setRangeText");
+                defer scratch.release();
+                const new_value = try std.mem.concat(scratch.allocator(), u8, &.{ value[0..byte_start], replacement, value[byte_end..] });
+                try self.setValue(new_value, frame);
+            }
+
+            const new_end: u32 = start + @as(u32, @intCast(CData.utf16Len(replacement)));
+            var new_start = sel_start;
+            var new_sel_end = sel_end;
+            switch (mode) {
+                .select => {
+                    new_start = start;
+                    new_sel_end = new_end;
+                },
+                .start => {
+                    new_start = start;
+                    new_sel_end = start;
+                },
+                .end => {
+                    new_start = new_end;
+                    new_sel_end = new_end;
+                },
+                .preserve => {
+                    // keep the selection on the same text: shift it past the
+                    // replaced range, or snap it to the range's edges inside it
+                    const delta: i64 = @as(i64, @intCast(replacement.len)) - @as(i64, end - start);
+                    if (sel_start > end) {
+                        new_start = @intCast(@as(i64, sel_start) + delta);
+                    } else if (sel_start > start) {
+                        new_start = start;
+                    }
+                    if (sel_end > end) {
+                        new_sel_end = @intCast(@as(i64, sel_end) + delta);
+                    } else if (sel_end > start) {
+                        new_sel_end = new_end;
+                    }
+                },
+            }
+            return applySelectionRange(self, selectionOffsetFromJs(self, new_start), selectionOffsetFromJs(self, new_sel_end), .none, frame);
         }
 
         fn applySelectionRange(

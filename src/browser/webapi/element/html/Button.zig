@@ -62,8 +62,8 @@ pub fn getType(self: *const Button) []const u8 {
     return "submit";
 }
 
-pub fn getForm(self: *Button, frame: *Frame) ?*Form {
-    return Form.ownerOf(self.asElement(), frame);
+pub fn getForm(self: *Button) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *Button, frame: *Frame) !js.Array {
@@ -166,8 +166,8 @@ pub fn hasCustomValidity(self: *const Button) bool {
     return self._custom_validity != null;
 }
 
-fn getPopoverTargetElement(self: *Button, frame: *Frame) ?*Element {
-    return popover.invokerTarget(self.asNode(), self._popover_target, frame);
+fn getPopoverTargetElement(self: *Button) ?*Element {
+    return popover.invokerTarget(self.asNode(), self._popover_target);
 }
 
 fn setPopoverTargetElement(self: *Button, value: ?*Element, frame: *Frame) !void {
@@ -196,7 +196,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLButtonElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
