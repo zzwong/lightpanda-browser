@@ -1701,7 +1701,7 @@ test "cdp.target: parent detachment retires descendants across context lifetime 
             const parent_bc = try ctx.loadBrowserContext(.{ .id = "BID-PARENT", .url = "hi.html", .target_id = "TID-000000000P".*, .session_id = "SID-PARENT" });
             const parent_target = parent_bc.firstTarget().?;
             const child_bc = if (cross_context) cdp.findBrowserContext(try cdp.createBrowserContext()).? else parent_bc;
-            _ = try child_bc.session.createPage();
+            try ctx.processMessage(.{ .id = 900, .method = "Target.createTarget", .params = .{ .browserContextId = child_bc.id, .url = "about:blank" } });
             const child_target = child_bc.targets.items[child_bc.targets.items.len - 1];
             const child = try child_bc.attachSession(child_target, "SID-CHILD", "SID-PARENT");
             child.flatten = false;
