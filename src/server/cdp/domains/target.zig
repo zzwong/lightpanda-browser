@@ -657,7 +657,7 @@ test "cdp.target: disposeBrowserContext detaches target sessions" {
 
     // The connection remains usable; stale target/session IDs are not reused.
     try ctx.processMessage(.{ .id = 6, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
-    try testing.expect(!std.mem.eql(u8, &target_id, ctx.cdp().browser_context.?.target_id.?));
+    try testing.expect(!std.mem.eql(u8, &target_id, &ctx.cdp().browser_context.?.target_id.?));
     try testing.expect(!std.mem.eql(u8, primary_id, ctx.cdp().browser_context.?.session_id.?));
 }
 
@@ -1264,8 +1264,8 @@ test "cdp.target: root storage and permission commands select their context" {
     try ctx.expectSentResult(null, .{ .id = 1 });
     try ctx.processMessage(.{ .id = 2, .method = "Storage.setCookies", .params = .{ .browserContextId = second.id, .cookies = &.{.{ .name = "owner", .value = "second", .url = "https://example.test/" }} } });
     try ctx.expectSentResult(null, .{ .id = 2 });
-    try testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
-    try testing.expectEqualStrings("second", second.session.cookie_jar.cookies.items[0].value);
+    try std.testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
+    try std.testing.expectEqualStrings("second", second.session.cookie_jar.cookies.items[0].value);
     try ctx.processMessage(.{ .id = 3, .method = "Browser.grantPermissions", .params = .{ .browserContextId = second.id, .permissions = &[_][]const u8{"geolocation"} } });
     try ctx.expectSentResult(null, .{ .id = 3 });
     try testing.expectEqual(null, first.session.permissions.get("geolocation"));
@@ -1274,5 +1274,5 @@ test "cdp.target: root storage and permission commands select their context" {
     try ctx.expectSentResult(null, .{ .id = 4 });
     cdp.reapContexts();
     try testing.expect(cdp.browser_context.? == first);
-    try testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
+    try std.testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
 }
