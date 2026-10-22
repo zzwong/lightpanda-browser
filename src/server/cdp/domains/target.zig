@@ -353,10 +353,7 @@ fn sendMessageToTarget(cmd: *CDP.Command) !void {
         sessionId: []const u8,
     })) orelse return error.InvalidParams;
 
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    if (bc.firstTarget() == null) {
-        return error.TargetNotLoaded;
-    }
+    const bc = cmd.browser_context orelse return cmd.sendError(-32602, "No session with given id", .{});
     if (bc.attached_sessions.contains(params.sessionId) == false) {
         return cmd.sendError(-32602, "No session with given id", .{});
     }
