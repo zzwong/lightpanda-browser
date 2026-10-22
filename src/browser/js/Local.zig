@@ -58,10 +58,10 @@ handle: *const v8.Context,
 isolate: Isolate,
 call_arena: std.mem.Allocator,
 
-pub fn newString(self: *const Local, str: []const u8) js.String {
+pub fn newString(self: *const Local, str: []const u8) !js.String {
     return .{
         .local = self,
-        .handle = self.isolate.initStringHandle(str),
+        .handle = try self.isolate.initStringHandle(str),
     };
 }
 
@@ -80,7 +80,7 @@ pub fn newDate(self: *const Local, time_ms: f64) !js.Value {
 // StringToBigInt semantics: arbitrary precision, sign-aware, and it never
 // consults the page's globals. Fails on non-numeric digits.
 pub fn newBigInt(self: *const Local, digits: []const u8) !js.Value {
-    const str: *const v8.Value = @ptrCast(self.isolate.initStringHandle(digits));
+    const str: *const v8.Value = @ptrCast(try self.isolate.initStringHandle(digits));
     const handle = v8.v8__Value__ToBigInt(str, self.handle) orelse return error.JsException;
     return .{ .local = self, .handle = @ptrCast(handle) };
 }
@@ -149,12 +149,12 @@ pub fn compileFunction(
     extensions: []const *const v8.Object,
 ) !js.Function {
     // TODO: Make configurable.
-    const script_name = self.isolate.initStringHandle("anonymous");
-    const script_source = if (@TypeOf(src) == js.String) src.handle else self.isolate.initStringHandle(src);
+    const script_name = try self.isolate.initStringHandle("anonymous");
+    const script_source = if (@TypeOf(src) == js.String) src.handle else try self.isolate.initStringHandle(src);
 
     var parameter_list: [parameter_names.len]*const v8.String = undefined;
     inline for (0..parameter_names.len) |i| {
-        parameter_list[i] = self.isolate.initStringHandle(parameter_names[i]);
+        parameter_list[i] = try self.isolate.initStringHandle(parameter_names[i]);
     }
 
     // Create `ScriptOrigin`.
@@ -204,8 +204,8 @@ const CompileResult = struct {
 // Like compile, but takes an optional cached_data which is a previously
 // compiled and serialized script (see Script.Unbound.createCodeCache)
 pub fn compileWithCache(self: *const Local, src: []const u8, name: ?[]const u8, cached_data: ?[]const u8) !CompileResult {
-    const script_name = self.isolate.initStringHandle(name orelse "anonymous");
-    const script_source = self.isolate.initStringHandle(src);
+    const script_name = try self.isolate.initStringHandle(name orelse "anonymous");
+    const script_source = try self.isolate.initStringHandle(src);
 
     // Create ScriptOrigin
     var origin: v8.ScriptOrigin = undefined;
@@ -355,7 +355,7 @@ pub fn zigValueToJs(self: *const Local, value: anytype, comptime opts: CallOpts)
     // Check if it's a "simple" type. This is extracted so that it can be
     // reused by other parts of the code. "simple" types only require an
     // isolate to create (specifically, they don't our templates array)
-    if (js.simpleZigValueToJs(isolate, value, false, opts.null_as_undefined)) |js_value_handle| {
+    if (try js.simpleZigValueToJs(isolate, value, false, opts.null_as_undefined)) |js_value_handle| {
         return .{ .local = self, .handle = js_value_handle };
     }
 
@@ -533,10 +533,10 @@ fn zigJsonToJs(self: *const Local, value: std.json.Value) !js.Value {
     const isolate = self.isolate;
 
     switch (value) {
-        .bool => |v| return .{ .local = self, .handle = js.simpleZigValueToJs(isolate, v, true, false) },
-        .float => |v| return .{ .local = self, .handle = js.simpleZigValueToJs(isolate, v, true, false) },
-        .integer => |v| return .{ .local = self, .handle = js.simpleZigValueToJs(isolate, v, true, false) },
-        .string => |v| return .{ .local = self, .handle = js.simpleZigValueToJs(isolate, v, true, false) },
+        .bool => |v| return .{ .local = self, .handle = try js.simpleZigValueToJs(isolate, v, true, false) },
+        .float => |v| return .{ .local = self, .handle = try js.simpleZigValueToJs(isolate, v, true, false) },
+        .integer => |v| return .{ .local = self, .handle = try js.simpleZigValueToJs(isolate, v, true, false) },
+        .string => |v| return .{ .local = self, .handle = try js.simpleZigValueToJs(isolate, v, true, false) },
         .null => return .{ .local = self, .handle = isolate.initNull() },
 
         // TODO handle number_string.
@@ -644,7 +644,7 @@ pub fn jsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !T {
                 }
 
                 if (!js_val.isArray()) {
-                    return error.InvalidArgument;
+                    return self.iterableToSlice(ptr.child, js_val);
                 }
                 const js_arr = js_val.toArray();
                 const arr = try self.call_arena.alloc(ptr.child, js_arr.len());
@@ -726,6 +726,40 @@ pub fn jsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !T {
     @compileError("has an unsupported parameter type: " ++ @typeName(T));
 }
 
+// A WebIDL sequence<T> from a non-Array value: any object with an
+// @@iterator method, iterated to its end (a Set, a Map's entries, a
+// generator, a NodeList...). Anything else is InvalidArgument. An exception
+// the page's iterator throws stays pending, as JsException.
+fn iterableToSlice(self: *const Local, comptime T: type, js_val: js.Value) ![]T {
+    var it = (js_val.iterator() catch |err| return iterationError(err)) orelse return error.InvalidArgument;
+    var items: std.ArrayList(T) = .empty;
+    while (it.next() catch |err| return iterationError(err)) |item| {
+        try items.append(self.call_arena, try self.jsValueToZig(T, item));
+    }
+    return items.items;
+}
+
+// Value.iterator rethrows the page's exception (TryCatchRethrow): it's
+// pending, so report it as one; a malformed iterator is InvalidArgument.
+// Anything else (ExecutionTerminated, OutOfMemory) passes through.
+fn iterationError(err: anyerror) anyerror {
+    return switch (err) {
+        error.TryCatchRethrow => error.JsException,
+        error.TypeError => error.InvalidArgument,
+        else => err,
+    };
+}
+
+// Whether `js_val` is an object with an @@iterator method, without calling
+// it (probing must not run the page's iterator).
+fn isIterable(js_val: js.Value) !bool {
+    if (!js_val.isObject()) {
+        return false;
+    }
+    const method = try js_val.toObject().getSymbol(v8.v8__Symbol__GetIterator(js_val.local.isolate.handle).?);
+    return method.isFunction();
+}
+
 // Extracted so that it can be used in both jsValueToZig and in
 // probeJsValueToZig. Avoids having to duplicate this logic when probing.
 fn jsValueToStruct(self: *const Local, comptime T: type, js_val: js.Value) !?T {
@@ -764,14 +798,11 @@ fn jsValueToStruct(self: *const Local, comptime T: type, js_val: js.Value) !?T {
             return .{ .values = arr };
         },
         js.BufferSource => {
-            if (v8.v8__Value__IsSharedArrayBuffer(js_val.handle)) {
+            if (js_val.isSharedArrayBuffer()) {
                 return error.TypeError;
             }
-            if (js_val.isArrayBufferView()) {
-                const view: *const v8.ArrayBufferView = @ptrCast(js_val.handle);
-                if (js.arrayBufferIsShared(v8.v8__ArrayBufferView__Buffer(view).?)) {
-                    return error.TypeError;
-                }
+            if (js_val.isArrayBufferView() and !js_val.isBufferSource()) {
+                return error.TypeError;
             }
             const bytes = (try jsValueToArrayBufferSlice(u8, true, js_val)) orelse return null;
             return .{ .bytes = bytes };
@@ -847,7 +878,7 @@ fn jsValueToStruct(self: *const Local, comptime T: type, js_val: js.Value) !?T {
                 if (comptime std.mem.eql(u8, name, dictionary_group_marker)) {
                     continue;
                 }
-                const key = isolate.initStringHandle(name);
+                const key = try isolate.initStringHandle(name);
                 if (js_obj.has(key)) {
                     const member = try js_obj.get(key);
                     const default_for_undefined = comptime attrs.defaultValue(FieldType);
@@ -1149,7 +1180,12 @@ fn probeJsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !Pr
                 }
 
                 if (!js_val.isArray()) {
-                    return .{ .invalid = {} };
+                    // A WebIDL sequence also takes any iterable object, and
+                    // union conversion picks it over a record, which js.Object
+                    // stands for in unions like Headers' init (a URLSearchParams
+                    // or a FormData there is a sequence of pairs). An interface
+                    // variant is declared, and so probed, before the sequence.
+                    return if (try isIterable(js_val)) .{ .ok = {} } else .{ .invalid = {} };
                 }
 
                 // This can get tricky.
@@ -1534,7 +1570,7 @@ pub fn createPromiseResolver(self: *const Local) js.PromiseResolver {
 
 // == Misc ==
 pub fn parseJSON(self: *const Local, json: []const u8) !js.Value {
-    const string_handle = self.isolate.initStringHandle(json);
+    const string_handle = try self.isolate.initStringHandle(json);
     const value_handle = v8.v8__JSON__Parse(self.handle, string_handle) orelse return error.JsException;
     return .{
         .local = self,

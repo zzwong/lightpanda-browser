@@ -115,18 +115,21 @@ fn assertOwns(self: *const StyleManager, el_: ?*const Element) void {
 /// at-rule nesting; without a cap a hostile inline stylesheet could blow the
 /// Zig stack via the mutually-recursive `applyMediaAtRule` / `applyLayerAtRule`
 /// `applyInnerRules` frames. 32 is well past anything seen in the wild.
-const MAX_AT_RULE_NESTING: u8 = 32;
+pub const MAX_AT_RULE_NESTING: u8 = 32;
 
 fn parseSheet(self: *StyleManager, build_arena: Allocator, sheet: *CSSStyleSheet) !void {
     if (sheet._css_rules) |css_rules| {
         for (css_rules._rules.items) |rule| {
             switch (rule._type) {
-                .style => |sr| _ = try self.addRule(sr),
+                .style => |sr| {
+                    _ = try self.addRule(sr);
+                    try self.addNestedCssomRules(build_arena, sr, sr._selector_text, 0);
+                },
                 // Re-parse the stored source so an `@media` rule inserted via
                 // `insertRule` / `replaceSync` participates in the cascade
                 // when its query matches the viewport.
-                .media => try self.applyMediaAtRule(build_arena, rule._text, 0, NO_LAYER),
-                .layer => try self.applyLayerAtRule(build_arena, rule._text, 0, NO_LAYER),
+                .media => try self.applyMediaAtRule(build_arena, rule._text, 0, NO_LAYER, null),
+                .layer => try self.applyLayerAtRule(build_arena, rule._text, 0, NO_LAYER, null),
                 else => {},
             }
         }
@@ -139,21 +142,22 @@ fn parseSheet(self: *StyleManager, build_arena: Allocator, sheet: *CSSStyleSheet
         var it = CssParser.parseStylesheet(text);
         while (it.next()) |parsed_rule| {
             switch (parsed_rule) {
-                .style => |s| try self.addRawRule(build_arena, s.selector, s.block, NO_LAYER),
-                .at_rule => |a| {
-                    // Only `@media` and `@layer` participate in the cascade
-                    // here. Other at-rules (`@keyframes`, `@supports`,
-                    // `@font-face`, …) don't carry top-level declarations
-                    // relevant to the visibility filter and stay skipped as
-                    // before.
-                    if (std.ascii.eqlIgnoreCase(a.keyword, "media")) {
-                        try self.applyMediaAtRule(build_arena, a.text, 0, NO_LAYER);
-                    } else if (std.ascii.eqlIgnoreCase(a.keyword, "layer")) {
-                        try self.applyLayerAtRule(build_arena, a.text, 0, NO_LAYER);
-                    }
-                },
+                .style => |s| try self.addRawRule(build_arena, s.selector, s.block, 0, NO_LAYER),
+                .at_rule => |a| try self.applyAtRule(build_arena, a.keyword, a.text, 0, NO_LAYER, null),
             }
         }
+    }
+}
+
+/// Apply an at-rule that takes part in the cascade. Only `@media` and `@layer`
+/// do here. Other at-rules (`@keyframes`, `@supports`, `@font-face`, …) don't
+/// carry declarations relevant to the visibility filter and are skipped.
+fn applyAtRule(self: *StyleManager, build_arena: Allocator, keyword: []const u8, text: []const u8, depth: u8, layer: u16, nest: ?[]const u8) Allocator.Error!void {
+    if (std.ascii.eqlIgnoreCase(keyword, "media")) {
+        return self.applyMediaAtRule(build_arena, text, depth, layer, nest);
+    }
+    if (std.ascii.eqlIgnoreCase(keyword, "layer")) {
+        return self.applyLayerAtRule(build_arena, text, depth, layer, nest);
     }
 }
 
@@ -162,7 +166,10 @@ fn parseSheet(self: *StyleManager, build_arena: Allocator, sheet: *CSSStyleSheet
 /// lived at the top level. Non-matching queries silently drop the inner
 /// rules. Inline-only by design: external `<link rel="stylesheet">` is out
 /// of scope for the headless engine.
-fn applyMediaAtRule(self: *StyleManager, build_arena: Allocator, text: []const u8, depth: u8, layer: u16) Allocator.Error!void {
+///
+/// `nest` is the selector of the style rule the at-rule is nested in (CSS
+/// Nesting), whose block the inner block then is; null at the top level.
+fn applyMediaAtRule(self: *StyleManager, build_arena: Allocator, text: []const u8, depth: u8, layer: u16, nest: ?[]const u8) Allocator.Error!void {
     if (depth >= MAX_AT_RULE_NESTING) {
         return;
     }
@@ -174,7 +181,7 @@ fn applyMediaAtRule(self: *StyleManager, build_arena: Allocator, text: []const u
         return;
     }
 
-    try self.applyInnerRules(build_arena, block.body, depth + 1, layer);
+    try self.applyAtRuleBody(build_arena, block.body, depth + 1, layer, nest);
 }
 
 /// Apply an `@layer` rule (css-cascade-5). Layers have two forms:
@@ -185,8 +192,8 @@ fn applyMediaAtRule(self: *StyleManager, build_arena: Allocator, text: []const u
 /// The layer parameter is the enclosing layer, or NO_LAYER at the top level.
 /// Priority is not assigned here, we need all the layers parsed to do that
 /// (since a layer statement can alter the ordering). So we'll do one final pass
-// in finalizerLayerRanks
-fn applyLayerAtRule(self: *StyleManager, build_arena: Allocator, text: []const u8, depth: u8, layer: u16) Allocator.Error!void {
+// in finalizerLayerRanks. `nest` is as for applyMediaAtRule.
+fn applyLayerAtRule(self: *StyleManager, build_arena: Allocator, text: []const u8, depth: u8, layer: u16, nest: ?[]const u8) Allocator.Error!void {
     if (depth >= MAX_AT_RULE_NESTING) {
         return;
     }
@@ -228,7 +235,16 @@ fn applyLayerAtRule(self: *StyleManager, build_arena: Allocator, text: []const u
     else
         try self.registerLayerPath(build_arena, layer, prelude);
 
-    try self.applyInnerRules(build_arena, block.body, depth + 1, id);
+    try self.applyAtRuleBody(build_arena, block.body, depth + 1, id, nest);
+}
+
+/// The block of an at-rule nested in a style rule is a block of that rule:
+/// `.a { @media (…) { color: red } }` is `@media (…) { .a { color: red } }`.
+fn applyAtRuleBody(self: *StyleManager, build_arena: Allocator, body: []const u8, depth: u8, layer: u16, nest: ?[]const u8) Allocator.Error!void {
+    if (nest) |selector| {
+        return self.addRawRule(build_arena, selector, body, depth, layer);
+    }
+    return self.applyInnerRules(build_arena, body, depth, layer);
 }
 
 /// Parse a conditional at-rule's inner block, adding style rules to the
@@ -239,14 +255,8 @@ fn applyInnerRules(self: *StyleManager, build_arena: Allocator, inner: []const u
     var it = CssParser.parseStylesheet(inner);
     while (it.next()) |nested_rule| {
         switch (nested_rule) {
-            .style => |s| try self.addRawRule(build_arena, s.selector, s.block, layer),
-            .at_rule => |nested| {
-                if (std.ascii.eqlIgnoreCase(nested.keyword, "media")) {
-                    try self.applyMediaAtRule(build_arena, nested.text, depth, layer);
-                } else if (std.ascii.eqlIgnoreCase(nested.keyword, "layer")) {
-                    try self.applyLayerAtRule(build_arena, nested.text, depth, layer);
-                }
-            },
+            .style => |s| try self.addRawRule(build_arena, s.selector, s.block, depth, layer),
+            .at_rule => |nested| try self.applyAtRule(build_arena, nested.keyword, nested.text, depth, layer, null),
         }
     }
 }
@@ -472,13 +482,34 @@ fn layerRank(self: *const StyleManager, priority: u64) u64 {
     return rank;
 }
 
-fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []const u8, block_text: []const u8, layer: u16) !void {
+/// `depth` bounds the recursion through nested rules and at-rules, as
+/// MAX_AT_RULE_NESTING does for at-rules alone.
+fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []const u8, block_text: []const u8, depth: u8, layer: u16) Allocator.Error!void {
     if (selector_text.len == 0) {
         return;
     }
     var customs: CustomSink = .{ .allocator = build_arena };
     const folded = try foldDeclarations(Declarations, CssParser.parseStyleBlock(block_text), &customs);
     _ = try self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs.map.values(), layer);
+
+    // CSS Nesting: the rules nested in the block follow their parent in
+    // cascade order. Most blocks have none, and every nested rule needs a `{`.
+    if (depth >= MAX_AT_RULE_NESTING or std.mem.findScalar(u8, block_text, '{') == null) {
+        return;
+    }
+    var it = CssParser.parseStyleBlock(block_text);
+    while (it.nextItem()) |item| {
+        switch (item) {
+            .declaration => {},
+            .rule => |nested| {
+                // The arena, not build_arena: a custom property's rule keeps
+                // its selector text past the rebuild.
+                const selector = try CssParser.resolveNestedSelector(self.arena.allocator(), selector_text, nested.selector) orelse continue;
+                try self.addRawRule(build_arena, selector, nested.block, depth + 1, layer);
+            },
+            .at_rule => |nested| try self.applyAtRule(build_arena, nested.keyword, nested.text, depth + 1, layer, selector_text),
+        }
+    }
 }
 
 // Tracked rules get one group Rule per selector (not per selector list)
@@ -1245,7 +1276,12 @@ fn matchesUaDisplayNoneRule(el: *Element, frame: *Frame) bool {
 /// The CSSOM twin of addRawRule; returns whether the rule set any tracked
 /// property.
 fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
-    const selector_text = style_rule._selector_text;
+    return self.addRuleAs(style_rule, style_rule._selector_text);
+}
+
+/// Add a style rule's declarations under `selector_text`: its own selector,
+/// or for a nested rule, that selector resolved against its parent's.
+fn addRuleAs(self: *StyleManager, style_rule: *CSSStyleRule, selector_text: []const u8) !bool {
     if (selector_text.len == 0) {
         return false;
     }
@@ -1261,6 +1297,29 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
     return self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs, NO_LAYER);
 }
 
+/// The CSSOM counterpart to the nested rules addRawRule adds: a style rule
+/// keeps the rules nested in its block in `_rules`. `parent_selector` is the
+/// parent's selector, already resolved when the parent is itself nested.
+fn addNestedCssomRules(self: *StyleManager, build_arena: Allocator, parent: *CSSStyleRule, parent_selector: []const u8, depth: u8) Allocator.Error!void {
+    const nested_rules = parent._rules orelse return;
+    if (depth >= MAX_AT_RULE_NESTING) {
+        return;
+    }
+    for (nested_rules._rules.items) |rule| {
+        switch (rule._type) {
+            .style => |sr| {
+                // The arena, as in addRawRule.
+                const selector = try CssParser.resolveNestedSelector(self.arena.allocator(), parent_selector, sr._selector_text) orelse continue;
+                _ = try self.addRuleAs(sr, selector);
+                try self.addNestedCssomRules(build_arena, sr, selector, depth + 1);
+            },
+            .media => try self.applyMediaAtRule(build_arena, rule._text, depth + 1, NO_LAYER, parent_selector),
+            .layer => try self.applyLayerAtRule(build_arena, rule._text, depth + 1, NO_LAYER, parent_selector),
+            else => {},
+        }
+    }
+}
+
 /// A style rule appended at or after the sheet that emitted the last rule is
 /// last in cascade order, so it joins the buckets directly. Anything else
 /// takes the rebuild path.
@@ -1273,7 +1332,8 @@ pub fn ruleInserted(self: *StyleManager, sheet: *CSSStyleSheet, rule: *CSSRule) 
         .style => |s| s,
         else => return self.sheetModified(),
     };
-    if (!self.appendable(sheet, rule)) {
+    // A rule with nested rules takes the rebuild path, which adds them.
+    if (style_rule._rules != null or !self.appendable(sheet, rule)) {
         return self.sheetModified();
     }
     const added = self.addRule(style_rule) catch return self.sheetModified();
@@ -1432,6 +1492,17 @@ fn countCompoundSpecificity(compound: Selector.Compound, ids: *u32, classes: *u3
                         // Unpack and add to our counts
                         ids.* += (max_nested >> 20) & 0x3FF;
                         classes.* += (max_nested >> 10) & 0x3FF;
+                        elements.* += max_nested & 0x3FF;
+                    },
+                    // :nth-child(An+B of S) is a pseudo-class plus its most specific argument
+                    .nth_child_of, .nth_last_child_of => |nth_of| {
+                        var max_nested: u32 = 0;
+                        for (nth_of.selectors) |nested_sel| {
+                            const spec = computeSpecificity(nested_sel);
+                            if (spec > max_nested) max_nested = spec;
+                        }
+                        ids.* += (max_nested >> 20) & 0x3FF;
+                        classes.* += 1 + ((max_nested >> 10) & 0x3FF);
                         elements.* += max_nested & 0x3FF;
                     },
                     // All other pseudo-classes count as class-level specificity
