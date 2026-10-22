@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const js = @import("js/js.zig");
 const Frame = @import("Frame.zig");
+const URL = @import("URL.zig");
 const Browser = @import("Browser.zig");
 const Session = @import("Session.zig");
 const HttpClient = @import("../network/HttpClient.zig");
@@ -485,6 +486,9 @@ fn hasRunnablePage(session: *Session) bool {
             // An image or raw document has a JS context too: its timers and
             // animation frames run like an HTML document's.
             .html, .complete, .raw_done => return true,
+            .pre => {
+                if (page.frame.document._ready_state == .complete and URL.isAboutBlank(page.frame.url)) return true;
+            },
             else => {},
         }
     }
@@ -730,7 +734,6 @@ test "Runner: networkidle waits out activity after the frame latched idle" {
     try again.waitForFrame(page.frame_id, 3000, .{ .until = .networkidle });
     try testing.expectEqual(true, lp.datetime.milliTimestamp(.boot) - again_start < 250);
 }
-
 
 test "Runner: fresh initial about blank advances timers and promise continuations" {
     const page = try testing.test_session.createPage();
