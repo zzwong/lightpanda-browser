@@ -186,7 +186,7 @@ fn cancelInvocation(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-// Called from BrowserContext.deinit. Sends `toolResponded { status: "Canceled" }`
+// Called before closing a target or detaching its sessions. Sends `toolResponded { status: "Canceled" }`
 // for every pending invocation so a CDP client waiting on `invokeTool` doesn't
 // see the invocation go silent on teardown. The V8 promise callbacks become
 // unreachable once the JS context is torn down by browser.closeSession, so
@@ -481,6 +481,51 @@ test "cdp.WebMCP: cancelInvocation" {
         .invocationId = "INV-0000000001",
         .status = "Canceled",
     }, .{ .session_id = "SID-M" });
+}
+
+test "cdp.regression: closing a target cancels queued WebMCP reactions and preserves a peer" {
+    inline for (.{ false, true }) |dispose_context| {
+        inline for (.{ "Promise.resolve('done')", "Promise.reject(new Error('late'))" }) |result| {
+            var ctx = try testing.context();
+            defer ctx.deinit();
+            const bc = try ctx.loadBrowserContext(.{ .id = "BID-M", .session_id = "SID-M", .target_id = "TID-000000000M".*, .url = "cdp/webmcp_fixture.html" });
+            const owner_id = bc.target_id.?;
+            const frame_id = id.toFrameId(bc.mainFrame().?._frame_id);
+            const peer_bc = ctx.cdp().findBrowserContext(try ctx.cdp().createBrowserContext()).?;
+            const peer_page = try peer_bc.session.createPage();
+            _ = try peer_bc.attachPrimarySession("SID-PEER");
+            try peer_page.navigate("http://127.0.0.1:9582/src/browser/tests/hi.html", .{});
+            var peer_runner = peer_bc.session.runner(.{});
+            try peer_runner.waitForFrame(peer_bc.mainFrame().?._frame_id, 2000, .{ .until = .done });
+            {
+                var ls: js.Local.Scope = undefined;
+                bc.mainFrame().?.js.localScope(&ls);
+                defer ls.deinit();
+                _ = try ls.local.exec("navigator.modelContext.registerTool({ name:'late', description:'queued reaction', execute:() => " ++ result ++ " });", null);
+            }
+            try ctx.processMessage(.{ .id = 1, .method = "WebMCP.invokeTool", .sessionId = "SID-M", .params = .{ .frameId = &frame_id, .toolName = "late" } });
+            try testing.expectEqual(1, bc.webmcp_invocations.count());
+            if (dispose_context) {
+                try ctx.processMessage(.{ .id = 2, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = bc.id } });
+            } else {
+                try ctx.processMessage(.{ .id = 2, .method = "Target.closeTarget", .params = .{ .targetId = &owner_id } });
+            }
+            try ctx.processMessage(.{ .id = 3, .method = "Runtime.evaluate", .sessionId = "SID-PEER", .params = .{ .expression = "42", .returnByValue = true } });
+            ctx.cdp().browser.env.runMicrotasks();
+            try ctx.expectSentResult(.{ .result = .{ .type = "number", .value = 42 } }, .{ .id = 3, .session_id = "SID-PEER" });
+            try ctx.expectSentEvent("WebMCP.toolResponded", .{ .invocationId = "INV-0000000001", .status = "Canceled" }, .{ .session_id = "SID-M" });
+            var responses: usize = 0;
+            var index: usize = 0;
+            while (try ctx.getSentMessage(index)) |message| : (index += 1) {
+                const method = message.object.get("method") orelse continue;
+                if (std.mem.eql(u8, method.string, "WebMCP.toolResponded")) responses += 1;
+            }
+            try testing.expectEqual(1, responses);
+            try ctx.cdp().tick();
+            try ctx.processMessage(.{ .id = 4, .method = "Runtime.evaluate", .sessionId = "SID-PEER", .params = .{ .expression = "43", .returnByValue = true } });
+            try ctx.expectSentResult(.{ .result = .{ .type = "number", .value = 43 } }, .{ .id = 4, .session_id = "SID-PEER" });
+        }
+    }
 }
 
 // Serializes a slice of `*const ModelContext.Tool` as the

@@ -715,6 +715,7 @@ pub const BrowserContext = struct {
         // It appends async tasks, so we make sure we run the message loop
         // before deinit it.
         env.inspector.?.resetContextGroup(self.group_id);
+        @import("domains/webmcp.zig").cancelAllPending(self);
         self.detachAllSessions();
 
         // abort all intercepted requests before closing the session/page
@@ -726,11 +727,6 @@ pub const BrowserContext = struct {
                 transfer.abortParked(error.ClientDisconnect);
             }
         }
-
-        // Notify any CDP client waiting on an in-flight WebMCP invocation
-        // before the V8 context (and its promise callbacks) get torn down
-        // by browser.closeSession below.
-        @import("domains/webmcp.zig").cancelAllPending(self);
 
         for (self.isolated_worlds.items) |world| {
             world.deinit();
@@ -976,6 +972,7 @@ pub const BrowserContext = struct {
     // on targetDestroyed, so both are sent even when nothing was attached.
     pub fn closeTarget(self: *BrowserContext) !void {
         const target_id = self.target_id orelse return;
+        @import("domains/webmcp.zig").cancelAllPending(self);
         const cdp = self.cdp;
         for (self.attached_sessions.values()) |session| {
             self.fetchDisableForSession(session.id);
