@@ -17,15 +17,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const lp = @import("lightpanda");
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
 
 const Session = @import("../../../browser/Session.zig");
+const URL = @import("../../../browser/URL.zig");
+const js = @import("../../../browser/js/js.zig");
 const Notification = @import("../../../Notification.zig");
 const PermissionState = @import("../../../browser/webapi/Permissions.zig").State;
-
-const log = lp.log;
 
 // TODO: hard coded data
 const PROTOCOL_VERSION = "1.3";
@@ -183,17 +182,23 @@ fn grantPermissions(cmd: *CDP.Command) !void {
         browserContextId: ?[]const u8 = null,
     })) orelse return error.InvalidParams;
 
-    if (params.origin) |v| {
-        log.debug(.not_implemented, "Browser.grantPermissions", .{ .param = "origin", .value = v });
-    }
     if (params.browserContextId) |bid| {
         const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
         if (!std.mem.eql(u8, bid, bc.id)) return error.UnknownBrowserContextId;
     }
 
-    const browser = (cmd.browser_context orelse try cmd.createBrowserContext()).session;
+    const origin = normalizePermissionOrigin(cmd, params.origin) catch |err| switch (err) {
+        error.InvalidOrigin => return cmd.sendError(-32602, "Invalid origin", .{}),
+        else => return err,
+    };
+
+    const session = (cmd.browser_context orelse try cmd.createBrowserContext()).session;
     for (params.permissions) |name| {
-        try browser.setPermission(name, .granted);
+        if (origin) |key| {
+            try session.setOriginPermission(key, name, .granted);
+        } else {
+            try session.setPermission(name, .granted);
+        }
     }
 
     return cmd.sendResult(null, .{});
@@ -209,9 +214,6 @@ fn setPermission(cmd: *CDP.Command) !void {
         browserContextId: ?[]const u8 = null,
     })) orelse return error.InvalidParams;
 
-    if (params.origin) |v| {
-        log.debug(.not_implemented, "Browser.setPermission", .{ .param = "origin", .value = v });
-    }
     if (params.browserContextId) |bid| {
         const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
         if (!std.mem.eql(u8, bid, bc.id)) return error.UnknownBrowserContextId;
@@ -220,8 +222,27 @@ fn setPermission(cmd: *CDP.Command) !void {
     const state = std.meta.stringToEnum(PermissionState, params.setting) orelse {
         return error.InvalidPermissionSetting;
     };
-    try (cmd.browser_context orelse try cmd.createBrowserContext()).session.setPermission(params.permission.name, state);
+    const origin = normalizePermissionOrigin(cmd, params.origin) catch |err| switch (err) {
+        error.InvalidOrigin => return cmd.sendError(-32602, "Invalid origin", .{}),
+        else => return err,
+    };
+
+    const session = (cmd.browser_context orelse try cmd.createBrowserContext()).session;
+    if (origin) |key| {
+        try session.setOriginPermission(key, params.permission.name, state);
+    } else {
+        try session.setPermission(params.permission.name, state);
+    }
     return cmd.sendResult(null, .{});
+}
+
+fn normalizePermissionOrigin(cmd: *CDP.Command, raw: ?[]const u8) !?[]const u8 {
+    const value = raw orelse return null;
+    const resolved = URL.resolve(cmd.arena, "", value, .{}) catch |err| switch (err) {
+        error.TypeError => return error.InvalidOrigin,
+        else => return err,
+    };
+    return (try URL.getOrigin(cmd.arena, resolved)) orelse error.InvalidOrigin;
 }
 
 // Clear all granted permissions; navigator.permissions.query() falls back to
@@ -347,6 +368,109 @@ test "cdp.browser: disposing a context clears its permission overrides" {
     try testing.expectEqual(null, ctx.cdp().browser_context);
     const fresh = try ctx.loadBrowserContext(.{ .id = "BID-PERM-NEW" });
     try testing.expectEqual(@as(usize, 0), fresh.session.permissions.count());
+}
+
+test "cdp.browser: origin-scoped permissions reach query and geolocation" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PERM-ORIGIN", .url = "cdp/dom1.html" });
+    const session = bc.session;
+    const origin_a = "http://127.0.0.1:9582";
+    const origin_b = "http://127.0.0.1:9583";
+
+    try ctx.processMessage(.{
+        .id = 50,
+        .method = "Browser.setPermission",
+        .params = .{ .permission = .{ .name = "geolocation" }, .setting = "granted" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 50 });
+
+    try ctx.processMessage(.{
+        .id = 51,
+        .method = "Browser.setPermission",
+        .params = .{ .permission = .{ .name = "geolocation" }, .setting = "denied", .origin = "http://127.0.0.1:9582/path" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 51 });
+
+    try ctx.processMessage(.{
+        .id = 52,
+        .method = "Browser.grantPermissions",
+        .params = .{ .permissions = &[_][]const u8{"geolocation"}, .origin = "http://127.0.0.1:9583/path" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 52 });
+
+    try testing.expectEqual(.denied, session.getPermission(origin_a, "geolocation"));
+    try testing.expectEqual(.granted, session.getPermission(origin_b, "geolocation"));
+    try testing.expectEqual(.granted, session.getPermission("http://127.0.0.1:9584", "geolocation"));
+
+    try ctx.processMessage(.{ .id = 53, .method = "Runtime.evaluate", .sessionId = "SID-X", .params = .{
+        .expression = "navigator.permissions.query({ name: 'geolocation' }).then(p => p.state)",
+        .awaitPromise = true,
+        .returnByValue = true,
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "denied" } }, .{ .id = 53, .session_id = "SID-X" });
+
+    try ctx.processMessage(.{
+        .id = 54,
+        .method = "Emulation.setGeolocationOverride",
+        .params = .{ .latitude = 48.0, .longitude = 2.0, .accuracy = 10 },
+    });
+    try ctx.expectSentResult(null, .{ .id = 54 });
+    try testing.expectEqual(1, try geolocationErrorCodeFor(bc));
+
+    try ctx.processMessage(.{ .id = 55, .method = "Browser.resetPermissions" });
+    try ctx.expectSentResult(null, .{ .id = 55 });
+    try testing.expectEqual(@as(usize, 0), session.permissions.count());
+    try testing.expectEqual(@as(usize, 0), session.origin_permissions.count());
+    try testing.expectEqual(.prompt, session.getPermission(origin_a, "geolocation"));
+    try testing.expectEqual(.prompt, session.getPermission(origin_b, "geolocation"));
+}
+
+test "cdp.browser: permission origins normalize default ports and reject invalid origins" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PERM-NORMALIZE", .url = "cdp/dom1.html" });
+    const session = bc.session;
+
+    try ctx.processMessage(.{
+        .id = 60,
+        .method = "Browser.setPermission",
+        .params = .{ .permission = .{ .name = "geolocation" }, .setting = "denied", .origin = "HTTP://Example.TEST:80/path?x=1" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 60 });
+    try testing.expectEqual(.denied, session.getPermission("http://example.test", "geolocation"));
+    try testing.expectEqual(null, session.origin_permissions.get("http://example.test:80"));
+
+    try ctx.processMessage(.{
+        .id = 61,
+        .method = "Browser.grantPermissions",
+        .params = .{ .permissions = &[_][]const u8{"notifications"}, .origin = "https://EXAMPLE.TEST:443/settings" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 61 });
+    try testing.expectEqual(.granted, session.getPermission("https://example.test", "notifications"));
+
+    const scoped_count = session.origin_permissions.count();
+    const global_count = session.permissions.count();
+    try ctx.processMessage(.{
+        .id = 62,
+        .method = "Browser.setPermission",
+        .params = .{ .permission = .{ .name = "geolocation" }, .setting = "granted", .origin = "relative/path" },
+    });
+    try ctx.expectSentError(-32602, "Invalid origin", .{ .id = 62 });
+    try testing.expectEqual(scoped_count, session.origin_permissions.count());
+    try testing.expectEqual(global_count, session.permissions.count());
+    try testing.expectEqual(.prompt, session.getPermission(null, "geolocation"));
+
+    try ctx.processMessage(.{
+        .id = 63,
+        .method = "Browser.grantPermissions",
+        .params = .{ .permissions = &[_][]const u8{"geolocation"}, .origin = "data:text/plain,opaque" },
+    });
+    try ctx.expectSentError(-32602, "Invalid origin", .{ .id = 63 });
+    try testing.expectEqual(scoped_count, session.origin_permissions.count());
+    try testing.expectEqual(global_count, session.permissions.count());
 }
 
 test "cdp.browser: setDownloadBehavior stores config on the session" {
@@ -511,4 +635,31 @@ test "cdp.browser: unknown permission context does not create a context" {
     });
     try ctx.expectSentError(-31998, "BrowserContextNotLoaded", .{ .id = 1 });
     try testing.expectEqual(null, ctx.cdp().browser_context);
+}
+
+fn geolocationErrorCodeFor(bc: *CDP.BrowserContext) !i32 {
+    const frame = bc.mainFrame() orelse unreachable;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+
+        _ = try ls.local.exec(
+            \\ window.__origin_geo_code = 0;
+            \\ navigator.geolocation.getCurrentPosition(
+            \\   () => { window.__origin_geo_code = 0; },
+            \\   (err) => { window.__origin_geo_code = err.code; },
+            \\ );
+        , null);
+    }
+
+    var runner = bc.session.runner(.{});
+    _ = try runner.tickForFrame(bc.page_handle.?.frame_id, 1000, .{ .until = .done });
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    return (try ls.local.exec("window.__origin_geo_code", null)).toZig(i32);
 }
