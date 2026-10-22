@@ -2150,7 +2150,9 @@ test "user_input: mouse hit testing still enters a blank child document" {
     const y = rect.y + 1;
     const edge_hit = try mouseHitTest(main, rect.x + iframe.asElement().getClientWidth(main), y);
     try testing.expect(edge_hit.frame == main);
-    try testing.expect(edge_hit.target == iframe.asElement());
+    try testing.expect(edge_hit.target != iframe.asElement());
+    const inside_hit = try mouseHitTest(main, rect.x + iframe.asElement().getClientWidth(main) - 1, y);
+    try testing.expect(inside_hit.frame == child);
 
     var ls: js.Local.Scope = undefined;
     child.js.localScope(&ls);
@@ -2616,6 +2618,8 @@ test "user_input: shadow mouse rects are viewport relative and native clicks rea
     try testing.expectEqual(host_rect.y + 5, rect.y);
     const x = rect.x + 1;
     const y = rect.y + 1;
+    const public_hit = try ls.local.compileAndRun(try std.fmt.allocPrint(frame.local_arena, "document.elementFromPoint({d}, {d}) === document.getElementById('host')", .{ x, y }), null);
+    try testing.expect(public_hit.isTrue());
     try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
     try triggerMouseMove(frame, x, y);
     try triggerMousePress(frame, x, y, mouse_button.main, 1);
@@ -2637,6 +2641,8 @@ test "user_input: shadow mouse hit testing respects bounds and hidden descendant
     const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
     const rect = inner.boundingClientRectValues(frame);
     try testing.expect((try mouseHitTest(frame, rect.x, rect.y)).target == inner);
+    try testing.expect((try mouseHitTest(frame, rect.x + rect.width, rect.y + 1)).target == host);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x + rect.width + 1, rect.y + 1)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height + 1)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x - 1, rect.y + 1)).target == host);
