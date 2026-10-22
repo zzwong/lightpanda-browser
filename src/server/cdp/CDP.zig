@@ -1554,6 +1554,10 @@ pub const Command = struct {
         return null;
     }
 
+    pub fn httpClient(self: *const Command) *HttpClient {
+        return if (self.browser_context) |bc| bc.session.http_client else &self.cdp.browser.http_client;
+    }
+
     pub fn createBrowserContext(self: *Command) !*BrowserContext {
         _ = try self.cdp.createBrowserContext();
         self.browser_context = &(self.cdp.browser_context.?);

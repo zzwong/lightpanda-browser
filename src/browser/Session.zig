@@ -33,6 +33,7 @@ const URL = @import("URL.zig");
 const Page = @import("Page.zig");
 const Frame = @import("Frame.zig");
 const Browser = @import("Browser.zig");
+const HttpClient = @import("../network/HttpClient.zig");
 const Geolocation = @import("webapi/geolocation/Geolocation.zig");
 const PermissionState = @import("webapi/Permissions.zig").State;
 pub const Runner = @import("Runner.zig");
@@ -52,6 +53,7 @@ const ArenaPool = App.ArenaPool;
 const Session = @This();
 
 browser: *Browser,
+http_client: *HttpClient,
 permissions: std.StringHashMapUnmanaged(PermissionState) = .empty,
 geolocation_override: ?Geolocation.Override = null,
 arena: *lp.Arena,
@@ -173,6 +175,7 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         .idb = IdbManager.init(allocator),
         .cache_store = CacheStore.init(allocator),
         .browser = browser,
+        .http_client = &browser.http_client,
         .notification = notification,
         .cookie_jar = storage.Cookie.Jar.init(allocator, notification),
         ._console_messages = .init(allocator),
@@ -213,7 +216,7 @@ pub fn deinit(self: *Session) void {
     // They still carry this notification and can outlive it, so clear the pointer here or
     // Transfer.kill's later notify() dispatches through a freed Notification
     // once the caller runs notification.deinit() after this returns.
-    var transfer_it = self.browser.http_client.transfers.valueIterator();
+    var transfer_it = self.http_client.transfers.valueIterator();
     while (transfer_it.next()) |t| {
         if (t.*.req.notification == self.notification) {
             t.*.req.notification = null;
@@ -629,7 +632,7 @@ pub fn idleSlice(self: *Session) u31 {
 
     if (self.pages.items.len == 0) {
         // no page, we don't want the watchdog to kill us.
-        self.browser.http_client.heartbeat.disarm();
+        self.http_client.watchdogHeartbeat().disarm();
         return quiet_ms;
     }
     const page = self.pages.items[0];
@@ -1171,7 +1174,7 @@ test "Session: a root navigation whose submit fails commits an error document" {
     const handle = try session.createPage();
     const live = handle.page().?;
 
-    const client = &session.browser.http_client;
+    const client = session.http_client;
     client.test_fail_submit = error.TestSubmitFailure;
     defer client.test_fail_submit = null;
 
@@ -1282,4 +1285,26 @@ test "Session: permission and coordinate overrides belong to their session" {
     try testing.expectEqual(.denied, second.permissions.get("geolocation").?);
     try testing.expectEqual(1, first.geolocation_override.?.latitude);
     try testing.expectEqual(4, second.geolocation_override.?.latitude);
+}
+
+test "Session: navigator reads its own network client" {
+    const browser = testing.test_session.browser;
+    const notification = try Notification.init(testing.allocator);
+    defer notification.deinit();
+    var client: HttpClient = undefined;
+    try client.init(browser.app);
+    defer client.deinit();
+    try client.setUserAgentOverride("SessionBot/1.0");
+    try client.setAcceptLanguageOverride("fr-FR,fr;q=0.9");
+    var session: Session = undefined;
+    try session.init(browser, notification);
+    defer session.deinit();
+    session.http_client = &client;
+    const frame = (try session.createPage()).frame().?;
+    const js = @import("js/js.zig");
+    var scope: js.Local.Scope = undefined;
+    frame.js.localScope(&scope);
+    defer scope.deinit();
+    try testing.expect((try scope.local.exec("navigator.userAgent === 'SessionBot/1.0' && navigator.language === 'fr-FR'", null)).toBool());
+    try testing.expect(!std.mem.eql(u8, browser.http_client.getUserAgent(), "SessionBot/1.0"));
 }
