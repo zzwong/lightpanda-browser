@@ -218,7 +218,7 @@ fn createTarget(cmd: *CDP.Command) !void {
 
     // attach to the target only if auto attach is set.
     if (cmd.cdp.target_auto_attach) {
-        try doAttachtoTarget(cmd, target_id);
+        try doAttachtoTarget(cmd, bc, target_id);
     }
 
     if (URL.isAboutBlank(params.url) == false) {
@@ -252,7 +252,7 @@ fn attachToTarget(cmd: *CDP.Command) !void {
     // browser session while the page session is live — get a distinct
     // auxiliary session so they don't collide with the primary one.
     if (bc.session_id == null) {
-        try doAttachtoTarget(cmd, target_id);
+        try doAttachtoTarget(cmd, bc, target_id);
         return cmd.sendResult(.{ .sessionId = bc.session_id }, .{});
     }
 
@@ -435,6 +435,12 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
         filter: ?[]const TargetFilter = null,
     })) orelse return error.InvalidParams;
 
+    if (cmd.input.session_id) |session_id| {
+        if (cmd.browser_context) |bc| {
+            if (bc.attached_sessions.contains(session_id)) return cmd.sendResult(null, .{});
+        }
+    }
+
     // set a flag to send Target.attachedToTarget events
     cmd.cdp.target_auto_attach = params.autoAttach;
 
@@ -453,19 +459,19 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
         return;
     }
 
-    // autoAttach is set to true, we must attach to all existing targets.
+    // Attach existing targets that were created before auto-attach was enabled.
     if (cmd.cdp.browser_contexts.items.len > 0) {
-        for (cmd.cdp.browser_contexts.items) |bc| {
-            if (bc.target_id == null) {
-                if (bc.mainFrame()) |frame| {
-                    // the target_id == the frame_id of the "root" frame
+        if (filterIncludesPage(params.filter)) {
+            for (cmd.cdp.browser_contexts.items) |bc| {
+                if (bc.session_id != null) continue;
+                if (bc.target_id == null) {
+                    const frame = bc.mainFrame() orelse continue;
                     bc.target_id = id.toFrameId(frame._frame_id);
-                    try doAttachtoTarget(cmd, &bc.target_id.?);
                 }
+                try doAttachtoTarget(cmd, bc, &bc.target_id.?);
             }
         }
-        try cmd.sendResult(null, .{});
-        return;
+        return cmd.sendResult(null, .{});
     }
 
     // This is a hack. Puppeteer, and probably others, expect the Browser to
@@ -1275,4 +1281,32 @@ test "cdp.target: root storage and permission commands select their context" {
     cdp.reapContexts();
     try testing.expect(cdp.browser_context.? == first);
     try std.testing.expectEqualStrings("first", first.session.cookie_jar.cookies.items[0].value);
+}
+
+test "cdp.target: late auto attach uses each context and page commands leave peers attached" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const cdp = ctx.cdp();
+    _ = try cdp.createBrowserContext();
+    const first = cdp.browser_contexts.items[0];
+    _ = try cdp.createBrowserContext();
+    const second = cdp.browser_contexts.items[1];
+    try ctx.processMessage(.{ .id = 1, .method = "Target.createTarget", .params = .{ .url = "about:blank", .browserContextId = first.id } });
+    try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank", .browserContextId = second.id } });
+    try testing.expectEqual(null, first.session_id);
+    try testing.expectEqual(null, second.session_id);
+    try ctx.processMessage(.{ .id = 3, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+    try testing.expect(first.session_id != null);
+    try testing.expect(second.session_id != null);
+    try testing.expect(!std.mem.eql(u8, first.session_id.?, second.session_id.?));
+    try testing.expect(first.attached_sessions.contains(first.session_id.?));
+    try testing.expect(second.attached_sessions.contains(second.session_id.?));
+    const first_session = first.session_id.?;
+    const second_session = second.session_id.?;
+    try ctx.processMessage(.{ .id = 4, .sessionId = first_session, .method = "Target.setAutoAttach", .params = .{ .autoAttach = false, .waitForDebuggerOnStart = false } });
+    try ctx.expectSentResult(null, .{ .id = 4, .session_id = first_session });
+    try testing.expect(cdp.target_auto_attach);
+    try std.testing.expectEqualStrings(first_session, first.session_id.?);
+    try std.testing.expectEqualStrings(second_session, second.session_id.?);
 }
