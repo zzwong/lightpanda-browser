@@ -391,3 +391,30 @@ test "cdp.log: entries go to the sessions that enabled the domain" {
     try testing.expectEqual(3, (try sentEntries(&ctx, "SID-AUX")).len);
     try testing.expectEqual(0, (try sentEntries(&ctx, "SID-LOG")).len);
 }
+
+test "cdp.regression: wrapped Log commands select their auxiliary session" {
+    testing.silenceLog(&.{ .http, .js, .frame });
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-LOG", .target_id = "FID-0000000LOG".*, .session_id = "SID-LOG" });
+    _ = try bc.attachSession("SID-AUX", null);
+    try ctx.processMessage(.{ .id = 1, .method = "Target.sendMessageToTarget", .params = .{
+        .sessionId = "SID-AUX",
+        .message = "{\"id\":10,\"method\":\"Log.enable\"}",
+    } });
+    const page = try bc.session.createPage();
+    try page.navigate(fixtures ++ "log_subresources.html", .{});
+    try testing.waitForPage(bc);
+    try testing.expectEqual(3, (try sentEntries(&ctx, "SID-AUX")).len);
+    try testing.expectEqual(0, (try sentEntries(&ctx, "SID-LOG")).len);
+
+    try ctx.processMessage(.{ .id = 2, .method = "Log.enable", .sessionId = "SID-LOG" });
+    try ctx.processMessage(.{ .id = 3, .method = "Target.sendMessageToTarget", .params = .{
+        .sessionId = "SID-AUX",
+        .message = "{\"id\":11,\"method\":\"Log.disable\"}",
+    } });
+    try ctx.processMessage(.{ .id = 4, .method = "Page.navigate", .sessionId = "SID-LOG", .params = .{ .url = fixtures ++ "log_subresources.html" } });
+    try testing.waitForPage(bc);
+    try testing.expectEqual(3, (try sentEntries(&ctx, "SID-AUX")).len);
+    try testing.expectEqual(3, (try sentEntries(&ctx, "SID-LOG")).len);
+}
