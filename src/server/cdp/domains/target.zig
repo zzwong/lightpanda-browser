@@ -502,8 +502,7 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
     try cmd.sendResult(null, .{});
 }
 
-fn doAttachtoTarget(cmd: *CDP.Command, target_id: []const u8) !void {
-    const bc = cmd.browser_context.?;
+fn doAttachtoTarget(cmd: *CDP.Command, bc: *CDP.BrowserContext, target_id: []const u8) !void {
     const parent_id = bc.session_id;
 
     if (bc.session_id == null) {
@@ -1302,6 +1301,8 @@ test "cdp.target: late auto attach uses each context and page commands leave pee
     try testing.expect(!std.mem.eql(u8, first.session_id.?, second.session_id.?));
     try testing.expect(first.attached_sessions.contains(first.session_id.?));
     try testing.expect(second.attached_sessions.contains(second.session_id.?));
+    try ctx.expectSentEvent("Target.attachedToTarget", AttachToTarget{ .sessionId = first.session_id.?, .targetInfo = pageTargetInfo(first).? }, .{});
+    try ctx.expectSentEvent("Target.attachedToTarget", AttachToTarget{ .sessionId = second.session_id.?, .targetInfo = pageTargetInfo(second).? }, .{});
     const first_session = first.session_id.?;
     const second_session = second.session_id.?;
     try ctx.processMessage(.{ .id = 4, .sessionId = first_session, .method = "Target.setAutoAttach", .params = .{ .autoAttach = false, .waitForDebuggerOnStart = false } });
