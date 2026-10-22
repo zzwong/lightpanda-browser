@@ -362,6 +362,7 @@ fn navigate(cmd: *CDP.Command) !void {
     const opts: Frame.NavigateOpts = .{
         .reason = .address_bar,
         .cdp_id = cmd.input.id,
+        .cdp_session_id = try navigationSessionId(cmd, target),
         .kind = .{ .push = null },
         .referer = if (params.referrer) |source| try referrer.compute(frame.call_arena, policy, source, encoded_url) else null,
         .referrer_policy = policy,
@@ -430,6 +431,8 @@ fn doReload(cmd: *CDP.Command) !void {
     try session.initiateRootNavigation(frame._frame_id, reload_url, .{
         .reason = .address_bar,
         .cdp_id = cmd.input.id,
+        .cdp_session_id = try navigationSessionId(cmd, target),
+        .cdp_empty_result = true,
         .kind = .reload,
         .force = if (params) |p| p.ignoreCache orelse false else false,
         .method = if (prev_nav) |p| p.method else .GET,
@@ -508,6 +511,8 @@ fn navigateToHistoryEntry(cmd: *CDP.Command) !void {
     const opts = Frame.NavigateOpts{
         .reason = .history,
         .cdp_id = cmd.input.id,
+        .cdp_session_id = try navigationSessionId(cmd, target),
+        .cdp_empty_result = true,
         .kind = .{ .traverse = idx },
     };
 
@@ -629,18 +634,37 @@ pub fn frameCreated(target: *CDP.Target) !void {
 // an errorText (Chrome semantics: "present if and only if navigation has
 // failed") so the client isn't left waiting on the command id forever.
 pub fn frameNavigateFailed(target: *CDP.Target, event: *const Notification.FrameNavigateFailed) !void {
-    const session_id = target.session_id orelse return;
+    return sendNavigationResult(target, event.opts, .{
+        .frameId = &id.toFrameId(event.frame_id),
+        .loaderId = &id.toLoaderId(event.loader_id),
+        .errorText = network.errorText(event.err),
+    });
+}
 
-    const input_id = event.opts.cdp_id orelse return;
-    try target.cdp.sendJSON(.{
-        .id = input_id,
-        .result = .{
-            .frameId = &id.toFrameId(event.frame_id),
-            .loaderId = &id.toLoaderId(event.loader_id),
-            .errorText = network.errorText(event.err),
-        },
-        .sessionId = session_id,
-    }, .{});
+fn navigationSessionId(cmd: *const CDP.Command, target: *CDP.Target) ![]const u8 {
+    const requested = cmd.sessionId() orelse target.session_id orelse return error.SessionIdNotLoaded;
+    // The command's JSON arena resets before navigation completes.
+    const attached = target.bc.attached_sessions.get(requested) orelse return error.SessionNotAttached;
+    return attached.id;
+}
+
+fn sendNavigationResult(target: *CDP.Target, opts: anytype, result: anytype) !void {
+    if (opts.cdp_empty_result) return sendNavigationResultBody(target, opts, struct {}{});
+    return sendNavigationResultBody(target, opts, result);
+}
+
+fn sendNavigationResultBody(target: *CDP.Target, opts: anytype, result: anytype) !void {
+    const input_id = opts.cdp_id orelse return;
+    const session_id = opts.cdp_session_id orelse target.session_id orelse return;
+    const attached = target.bc.attached_sessions.get(session_id) orelse return;
+    const cdp = target.cdp;
+    if (!attached.flatten) {
+        const allocator = cdp.link.acquireSendArena();
+        defer cdp.link.releaseSendArena();
+        const raw = try std.json.Stringify.valueAlloc(allocator, .{ .id = input_id, .result = result }, .{});
+        return cdp.sendWrappedMessage(attached.id, attached.parent_id, raw);
+    }
+    return cdp.sendJSON(.{ .id = input_id, .result = result, .sessionId = attached.id }, .{});
 }
 
 // Fired from Frame.deinit while the frame's JS is still alive.
@@ -682,8 +706,6 @@ pub fn frameChildFrameDetached(target: *CDP.Target, event: *const Notification.F
 pub fn frameNavigated(arena: Allocator, target: *CDP.Target, event: *const Notification.FrameNavigated) !void {
     // detachTarget could be called, in which case, we still have a frame doing
     // things, but no session.
-    const session_id = target.session_id orelse return;
-
     const frame_id = &id.toFrameId(event.frame_id);
     const loader_id = &id.toLoaderId(event.loader_id);
 
@@ -694,16 +716,8 @@ pub fn frameNavigated(arena: Allocator, target: *CDP.Target, event: *const Notif
     // the frameStartedLoading, but before any lifecycleEvent. So we
     // unfortunately have to put the input_id ito the NavigateOpts which gets
     // passed back into the notification.
-    if (event.opts.cdp_id) |input_id| {
-        try cdp.sendJSON(.{
-            .id = input_id,
-            .result = .{
-                .frameId = frame_id,
-                .loaderId = loader_id,
-            },
-            .sessionId = session_id,
-        }, .{});
-    }
+    try sendNavigationResult(target, event.opts, .{ .frameId = frame_id, .loaderId = loader_id });
+    const session_id = target.session_id orelse return;
 
     if (target.page_life_cycle_events) {
         try cdp.sendEvent("Page.lifecycleEvent", LifecycleEvent{
@@ -2501,7 +2515,7 @@ test "cdp.frame: navigate answers with errorText when the navigation fails" {
     try ctx.expectSentResult(.{
         .frameId = "FID-0000000001",
         .loaderId = "LID-0000000002",
-        .errorText = "CouldntConnect",
+        .errorText = "net::ERR_CONNECTION_REFUSED",
     }, .{ .id = 52 });
 
     // As in Chrome, an error document replaces the active one, and committing
@@ -3141,4 +3155,60 @@ fn expectNavigatedWithinDocument(ctx: *testing.TestContext, expected: []const []
         i += 1;
     }
     try testing.expectEqual(expected.len, i);
+}
+
+fn auxiliaryNavigationReply(ctx: *testing.TestContext, session_id: []const u8, message_id: i64, flatten: bool) !?std.json.Value {
+    var index: usize = 0;
+    while (try ctx.getSentMessage(index)) |message| : (index += 1) {
+        if (flatten) {
+            const mid = message.object.get("id") orelse continue;
+            const sid = message.object.get("sessionId") orelse continue;
+            if (mid.integer == message_id and std.mem.eql(u8, sid.string, session_id)) return message;
+        } else {
+            const method = message.object.get("method") orelse continue;
+            if (!std.mem.eql(u8, method.string, "Target.receivedMessageFromTarget")) continue;
+            const params = message.object.get("params").?.object;
+            if (!std.mem.eql(u8, params.get("sessionId").?.string, session_id)) continue;
+            const inner = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, params.get("message").?.string, .{});
+            const mid = inner.object.get("id") orelse continue;
+            if (mid.integer == message_id) return inner;
+        }
+    }
+    return null;
+}
+
+test "cdp.page: successful and failed navigation keep the originating attachment" {
+    testing.silenceLog(&.{ .http, .frame, .js });
+    inline for (.{ false, true }) |flatten| {
+        inline for (.{ false, true }) |failed| {
+            var ctx = try testing.context();
+            defer ctx.deinit();
+            const bc = try ctx.loadBrowserContext(.{ .id = "BID-N", .url = "hi.html", .target_id = "TID-000000000N".*, .session_id = "SID-PRIMARY" });
+            const attached = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
+            attached.flatten = flatten;
+            const url = if (failed) "http://127.0.0.1:2/refused" else "http://127.0.0.1:9582/src/browser/tests/hi.html";
+            if (flatten) {
+                try ctx.processMessage(.{ .id = 101, .method = "Page.navigate", .sessionId = "SID-AUX", .params = .{ .url = url } });
+            } else {
+                const command = try std.json.Stringify.valueAlloc(testing.arena_allocator, .{ .id = 101, .method = "Page.navigate", .params = .{ .url = url } }, .{});
+                try ctx.processMessage(.{ .id = 1, .method = "Target.sendMessageToTarget", .params = .{ .sessionId = "SID-AUX", .message = command } });
+                try ctx.expectSentResult(null, .{ .id = 1 });
+            }
+            var reply: ?std.json.Value = null;
+            for (0..200) |_| {
+                reply = try auxiliaryNavigationReply(&ctx, "SID-AUX", 101, flatten);
+                if (reply != null) break;
+                try ctx.cdp().tick();
+            }
+            try testing.expect(reply != null);
+            const result = reply.?.object.get("result").?.object;
+            try testing.expect(result.get("frameId") != null);
+            if (failed) {
+                try testing.expectEqual("net::ERR_CONNECTION_REFUSED", result.get("errorText").?.string);
+            } else {
+                try testing.expectEqual(null, result.get("errorText"));
+            }
+            try testing.expectEqual(null, try auxiliaryNavigationReply(&ctx, "SID-PRIMARY", 101, true));
+        }
+    }
 }

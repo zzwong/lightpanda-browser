@@ -110,6 +110,7 @@ pub const ErrorReason = enum {
 
 // Chrome's net error for an ErrorReason's error, else the error's name.
 pub fn errorText(err: anyerror) []const u8 {
+    if (err == error.CouldntConnect) return ErrorReason.ConnectionRefused.netError();
     inline for (comptime std.enums.values(ErrorReason)) |reason| {
         if (err == reason.toError()) {
             return reason.netError();
@@ -827,7 +828,8 @@ test "cdp.network: errorText" {
     try testing.expectEqualSlices(u8, "net::ERR_TIMED_OUT", errorText(error.OperationTimedout));
     try testing.expectEqualSlices(u8, "net::ERR_FAILED", errorText(ErrorReason.Failed.toError()));
     try testing.expectEqualSlices(u8, "net::ERR_NAME_NOT_RESOLVED", errorText(ErrorReason.NameNotResolved.toError()));
-    try testing.expectEqualSlices(u8, "CouldntConnect", errorText(error.CouldntConnect));
+    try testing.expectEqualSlices(u8, "net::ERR_CONNECTION_REFUSED", errorText(error.CouldntConnect));
+    try testing.expectEqualSlices(u8, "UnrecognizedNetworkFailure", errorText(error.UnrecognizedNetworkFailure));
 }
 
 test "cdp.network emulateNetworkConditions and setBypassServiceWorker" {
