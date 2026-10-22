@@ -483,6 +483,7 @@ pub const BrowserContext = struct {
         id: []const u8,
         parent_id: ?[]const u8,
         flatten: bool = true,
+        runtime_enabled: bool = false,
         target: *Target,
         inspector_session: js.Inspector.Session,
 

@@ -68,13 +68,13 @@ pub fn processMessage(cmd: *CDP.Command) !void {
 
 fn enable(cmd: *CDP.Command) !void {
     const target = try cmd.target();
-    try target.runtimeEnable();
+    try target.runtimeEnable(cmd.sessionId() orelse target.session_id orelse return error.SessionNotAttached);
     return sendInspector(cmd);
 }
 
 fn disable(cmd: *CDP.Command) !void {
     const target = try cmd.target();
-    target.runtimeDisable();
+    target.runtimeDisable(cmd.sessionId() orelse target.session_id orelse return error.SessionNotAttached);
     return sendInspector(cmd);
 }
 
@@ -135,10 +135,8 @@ const ConsoleMessage = struct {
     args: []RemoteObject,
 };
 
-pub fn consoleMessage(arena: Allocator, target: *CDP.Target, event: *const Notification.ConsoleMessage) !void {
-    // The event goes to the primary session, so its argument handles are
-    // minted on the primary's inspector session.
-    const session_id = target.session_id orelse return;
+pub fn consoleMessage(arena: Allocator, target: *CDP.Target, session_id: []const u8, event: *const Notification.ConsoleMessage) !void {
+    // Each subscriber needs argument handles from its own inspector session.
     const inspector_session = try target.inspectorSession(session_id);
     const frame = eventFrame(target, event.frame_id) orelse return error.FrameNotLoaded;
 
@@ -189,9 +187,7 @@ fn inspectedContext(bc: *CDP.BrowserContext, local: *const js.Local, page: *cons
     return if (bc.inspector().getContextId(local) == 0) page else local;
 }
 
-pub fn exceptionThrown(arena: Allocator, target: *CDP.Target, event: *const Notification.ExceptionThrown) !void {
-    // Like consoleAPICalled: the primary session's inspector mints the handle.
-    const session_id = target.session_id orelse return;
+pub fn exceptionThrown(arena: Allocator, target: *CDP.Target, session_id: []const u8, event: *const Notification.ExceptionThrown) !void {
     const inspector_session = try target.inspectorSession(session_id);
     const frame = eventFrame(target, event.frame_id) orelse return error.FrameNotLoaded;
 
@@ -708,4 +704,31 @@ test "cdp.runtime: only nodes have the node subtype, DOMExceptions are errors" {
         const result = msg.object.get("result").?.object.get("result").?.object;
         try testing.expectEqual(null, result.get("subtype"));
     }
+}
+
+test "cdp.runtime: auxiliary console subscriptions and object handles stay independent" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-R", .url = "hi.html", .target_id = "TID-000000000R".*, .session_id = "SID-PRIMARY" });
+    _ = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
+    try ctx.processMessage(.{ .id = 1, .method = "Runtime.enable", .sessionId = "SID-AUX" });
+    try ctx.processMessage(.{ .id = 2, .method = "Runtime.evaluate", .sessionId = "SID-AUX", .params = .{ .expression = "console.log({owner:'aux'})" } });
+    try testing.expectEqual(1, try countSentEvents(&ctx, "Runtime.consoleAPICalled", "SID-AUX"));
+    try testing.expectEqual(0, try countSentEvents(&ctx, "Runtime.consoleAPICalled", "SID-PRIMARY"));
+    var index: usize = 0;
+    var object_id: ?[]const u8 = null;
+    while (try ctx.getSentMessage(index)) |message| : (index += 1) {
+        const method = message.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "Runtime.consoleAPICalled")) continue;
+        const args = message.object.get("params").?.object.get("args").?.array.items;
+        object_id = args[0].object.get("objectId").?.string;
+    }
+    try testing.expect(object_id != null);
+    try ctx.processMessage(.{ .id = 3, .method = "Runtime.callFunctionOn", .sessionId = "SID-AUX", .params = .{ .objectId = object_id.?, .functionDeclaration = "function(){return this.owner}", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "aux" } }, .{ .id = 3, .session_id = "SID-AUX" });
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.enable", .sessionId = "SID-PRIMARY" });
+    try ctx.processMessage(.{ .id = 5, .method = "Runtime.disable", .sessionId = "SID-AUX" });
+    try ctx.processMessage(.{ .id = 6, .method = "Runtime.evaluate", .sessionId = "SID-PRIMARY", .params = .{ .expression = "console.log('primary-only')" } });
+    try testing.expectEqual(1, try countSentEvents(&ctx, "Runtime.consoleAPICalled", "SID-AUX"));
+    try testing.expectEqual(1, try countSentEvents(&ctx, "Runtime.consoleAPICalled", "SID-PRIMARY"));
 }
