@@ -24,8 +24,8 @@ const CssParser = @import("../../css/Parser.zig");
 const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 const Element = @import("../Element.zig");
+const DOMMatrixReadOnly = @import("../DOMMatrixReadOnly.zig");
 
-const log = lp.log;
 const String = lp.String;
 const Allocator = std.mem.Allocator;
 
@@ -45,11 +45,11 @@ pub fn parseInlineStyle(self: *CSSStyleDeclaration, frame: *Frame) !void {
     }
     const el = self._element orelse return;
     const attr_value = el.getAttributeInterned("style") orelse return;
-    try self.applyDeclarations(attr_value, frame);
+    try self.applyDeclarations(CssParser.parseDeclarationsList(attr_value), frame);
 }
 
-fn applyDeclarations(self: *CSSStyleDeclaration, text: []const u8, frame: *Frame) !void {
-    var it = CssParser.parseDeclarationsList(text);
+fn applyDeclarations(self: *CSSStyleDeclaration, declarations: CssParser.DeclarationsIterator, frame: *Frame) !void {
+    var it = declarations;
     while (it.next()) |declaration| {
         try self.applyParsedDeclaration(declaration, frame);
     }
@@ -74,8 +74,19 @@ pub fn item(self: *const CSSStyleDeclaration, index: u32) []const u8 {
 }
 
 pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {
-    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const normalized = normalizePropertyName(frame.local_arena, property_name);
     const wrapped = String.wrap(normalized);
+    const value = self.propertyValue(normalized, wrapped, frame);
+
+    // The resolved transform is always a matrix: animation libraries
+    // (popmotion) regex it as matrix()/matrix3d() and crash on anything else.
+    if (self._is_computed and wrapped.eql(comptime .wrap("transform"))) {
+        return resolvedTransform(value, frame);
+    }
+    return value;
+}
+
+fn propertyValue(self: *const CSSStyleDeclaration, normalized: []const u8, wrapped: String, frame: *Frame) []const u8 {
 
     // Computed styles must reflect stylesheet rules, not just the element's
     // inline `style=` attribute. Limited to display/visibility — what aria
@@ -200,6 +211,59 @@ fn axisPair(self: *const CSSStyleDeclaration, prop: *const Property) ?AxisPair {
     return if (longhand.is_x) .{ .name = name, .x = prop, .y = partner } else .{ .name = name, .x = partner, .y = prop };
 }
 
+// "none", or the transform list collapsed into one matrix() / matrix3d(),
+// like Chrome. A value that doesn't parse resolves to "none", as an invalid
+// declaration never applies.
+fn resolvedTransform(value: []const u8, frame: *Frame) []const u8 {
+    var m = DOMMatrixReadOnly.identity();
+    var is_2d = true;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "none")) {
+        return "none";
+    }
+    DOMMatrixReadOnly.parseTransformList(trimmed, &m, &is_2d) catch return "none";
+
+    var buf = std.Io.Writer.Allocating.init(frame.local_arena);
+    const writer = &buf.writer;
+    const components: []const usize = if (is_2d) &.{ 0, 1, 4, 5, 12, 13 } else &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    writer.writeAll(if (is_2d) "matrix(" else "matrix3d(") catch return "none";
+    for (components, 0..) |c, i| {
+        if (i > 0) writer.writeAll(", ") catch return "none";
+        writeCssNumber(writer, m[c]) catch return "none";
+    }
+    writer.writeByte(')') catch return "none";
+    return buf.written();
+}
+
+// Six significant digits with trailing zeros dropped, as Chrome serializes
+// computed numbers (JS toPrecision(6), trimmed): 0.707107, 6.12323e-17.
+fn writeCssNumber(writer: *std.Io.Writer, value: f64) !void {
+    if (value == 0 or !std.math.isFinite(value)) {
+        return writer.writeAll("0");
+    }
+    const exponent: i32 = @intFromFloat(@floor(std.math.log10(@abs(value))));
+    var tmp: [64]u8 = undefined;
+    if (exponent < -6 or exponent >= 6) {
+        const str = try std.fmt.bufPrint(&tmp, "{e:.5}", .{value});
+        const e_index = std.mem.indexOfScalar(u8, str, 'e').?;
+        try writer.writeAll(trimFraction(str[0..e_index]));
+        try writer.writeByte('e');
+        const exp_str = str[e_index + 1 ..];
+        if (exp_str[0] != '-') try writer.writeByte('+');
+        return writer.writeAll(exp_str);
+    }
+    const decimals: usize = @intCast(5 - exponent);
+    const str = try std.fmt.bufPrint(&tmp, "{d:.[1]}", .{ value, decimals });
+    const trimmed = trimFraction(str);
+    // a value that rounds to zero at this precision has no sign
+    try writer.writeAll(if (std.mem.eql(u8, trimmed, "-0")) "0" else trimmed);
+}
+
+fn trimFraction(str: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, str, '.') == null) return str;
+    return std.mem.trimEnd(u8, std.mem.trimEnd(u8, str, "0"), ".");
+}
+
 fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame: *Frame) []const u8 {
     if (!element.isVisible(frame)) {
         return "auto";
@@ -212,7 +276,7 @@ fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame
 }
 
 pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {
-    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const normalized = normalizePropertyName(frame.local_arena, property_name);
     return if (self.declaredImportant(.wrap(normalized))) "important" else "";
 }
 
@@ -250,7 +314,7 @@ pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value:
 /// setProperty path, within a single declaration block a normal declaration must
 /// not override an earlier !important one (CSS cascade precedence).
 fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Declaration, frame: *Frame) !void {
-    const normalized = normalizePropertyName(declaration.name, &frame.buf);
+    const normalized = normalizePropertyName(frame.local_arena, declaration.name);
     if (CssParser.axisShorthand(normalized)) |shorthand| {
         const values = CssParser.splitAxisPair(declaration.value) orelse return;
         try self.applyParsedDeclaration(.{ .name = shorthand.x, .value = values.x, .important = declaration.important }, frame);
@@ -276,7 +340,7 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
         return (try self.removePropertyImpl(property_name, frame)) != null;
     }
 
-    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const normalized = normalizePropertyName(frame.local_arena, property_name);
     if (CssParser.axisShorthand(normalized)) |shorthand| {
         const values = CssParser.splitAxisPair(value) orelse return false;
         const x = try self.setPropertyImpl(shorthand.x, values.x, important, frame);
@@ -319,7 +383,7 @@ pub fn removeProperty(self: *CSSStyleDeclaration, property_name: []const u8, fra
 }
 
 fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, frame: *Frame) !?[]const u8 {
-    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const normalized = normalizePropertyName(frame.local_arena, property_name);
     if (CssParser.axisShorthand(normalized)) |shorthand| {
         const old_value = self.declaredValue(.wrap(shorthand.name), frame) orelse "";
         const x = try self.removePropertyImpl(shorthand.x, frame);
@@ -360,7 +424,7 @@ pub fn styleAttributeChanged(self: *CSSStyleDeclaration, text: ?[]const u8, fram
     // we need to get this declaration back in sync
     self.clearProperties(frame);
     if (text) |t| {
-        try self.applyDeclarations(t, frame);
+        try self.applyDeclarations(CssParser.parseDeclarationsList(t), frame);
     }
 }
 
@@ -399,15 +463,20 @@ pub fn setCssText(self: *CSSStyleDeclaration, text: []const u8, frame: *Frame) !
     if (self._is_computed) {
         return error.NoModificationAllowed;
     }
-    try self.replaceCssText(text, frame);
+    try self.replaceDeclarations(CssParser.parseDeclarationsList(text), frame);
 }
 
-// setCssText without the read-only check, for declarations that are never
-// computed (a CSSStyleRule's style).
-pub fn replaceCssText(self: *CSSStyleDeclaration, text: []const u8, frame: *Frame) !void {
+// A CSSStyleRule's style, from the rule's block in a stylesheet. Unlike
+// cssText, the block may nest rules (CSS Nesting); its declarations are the
+// ones around them.
+pub fn replaceStyleBlock(self: *CSSStyleDeclaration, block: []const u8, frame: *Frame) !void {
+    try self.replaceDeclarations(CssParser.parseStyleBlock(block), frame);
+}
+
+fn replaceDeclarations(self: *CSSStyleDeclaration, declarations: CssParser.DeclarationsIterator, frame: *Frame) !void {
     self.clearProperties(frame);
 
-    try self.applyDeclarations(text, frame);
+    try self.applyDeclarations(declarations, frame);
     try self.syncStyleAttribute(frame);
 }
 
@@ -459,17 +528,18 @@ pub fn findProperty(self: *const CSSStyleDeclaration, name: String) ?*Property {
     return null;
 }
 
-fn normalizePropertyName(name: []const u8, buf: []u8) []const u8 {
+fn normalizePropertyName(allocator: Allocator, name: []const u8) []const u8 {
     if (isCustomProperty(name)) {
         // Custom properties are case-sensitive
         return name;
     }
 
-    if (name.len > buf.len) {
-        log.info(.dom, "css.long.name", .{ .name = name });
+    // Internal lookups (layout, CDP) pass lowercase names, often outside of a
+    // JS call where nothing resets local_arena.
+    if (!Element.Attribute.needsLowerCasing(name)) {
         return name;
     }
-    return std.ascii.lowerString(buf, name);
+    return std.ascii.allocLowerString(allocator, name) catch name;
 }
 
 fn isCustomProperty(name: []const u8) bool {
@@ -1154,6 +1224,34 @@ pub const JsApi = struct {
 };
 
 const testing = @import("../../../testing.zig");
+test "WebApi: CSSStyleDeclaration computed transform" {
+    try testing.htmlRunner("css/computed_transform.html", .{});
+}
+
+test "writeCssNumber: six significant digits" {
+    const cases = [_]struct { f64, []const u8 }{
+        .{ 0, "0" },
+        .{ -0.0, "0" },
+        .{ 1, "1" },
+        .{ 10, "10" },
+        .{ -2.5, "-2.5" },
+        .{ 0.7071067811865476, "0.707107" },
+        .{ -0.7071067811865476, "-0.707107" },
+        .{ 6.123233995736766e-17, "6.12323e-17" },
+        .{ 123456.7, "123457" },
+        .{ 1234567, "1.23457e+6" },
+        .{ 0.0001, "0.0001" },
+        .{ 0.000001, "0.000001" },
+        .{ -1e-7, "-1e-7" },
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writeCssNumber(&writer, c[0]);
+        try testing.expectEqual(c[1], writer.buffered());
+    }
+}
+
 test "CSS property value storage is reused" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();

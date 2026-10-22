@@ -84,7 +84,6 @@ origin: ?[]const u8 = null,
 // can outlive it. Always true for a service worker: only a secure context can
 // register one.
 _secure_context: bool,
-buf: [1024]u8 = undefined, // same size as frame.buf
 // Document charset (matches Page.charset). Workers default to UTF-8.
 charset: []const u8 = "UTF-8",
 js: *JS.Context,
@@ -335,32 +334,29 @@ pub fn structuredClone(_: *const WorkerGlobalScope, value: JS.Value) !JS.Value {
     return value.structuredClone();
 }
 
-pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, rejection: JS.PromiseRejection) !void {
-    if (comptime lp.IS_DEBUG) {
-        log.debug(.js, "unhandled rejection", .{
-            .target = "worker",
-            .value = rejection.reason(),
-            .stack = rejection.local.stackTrace() catch |err| @errorName(err) orelse "???",
-        });
-    }
-
+// See Window.unhandledPromiseRejection.
+pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, promise: JS.Promise, reason: ?JS.Value) !bool {
     const event_name = if (no_handler) "unhandledrejection" else "rejectionhandled";
 
-    if (no_handler) {
-        self.page.recordJsError(error.JsException);
+    const target = self.asEventTarget();
+    if (!self._event_manager.hasDirectListeners(target, event_name)) {
+        return false;
     }
 
-    const target = self.asEventTarget();
-    if (self._event_manager.hasDirectListeners(target, event_name)) {
-        const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
-            .reason = if (rejection.reason()) |r| try r.persist() else null,
-            .promise = try rejection.promise().persist(),
-        }, self.page)).asEvent();
-        try self.dispatch(target, event, .{});
-    }
+    const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
+        .reason = if (reason) |r| try r.persist() else null,
+        .promise = try promise.persist(),
+        .cancelable = no_handler,
+    }, self.page)).asEvent();
+    // Keep the event alive past dispatch so we can read _prevent_default.
+    event.acquireRef();
+    defer event.releaseRef(self.page);
+
+    try self.dispatch(target, event, .{});
+    return event._prevent_default;
 }
 
-fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void {
+fn importScripts(self: *WorkerGlobalScope, urls: JS.Variadic([:0]const u8)) !void {
     if (self._is_module) {
         // not allowed to be called when the worker type is module (scripts should
         // use actual imports).
@@ -372,7 +368,7 @@ fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void {
     const arena = try session.getArena(.small, "importScript");
     defer arena.release();
 
-    for (urls) |url| {
+    for (urls.values) |url| {
         defer arena.resetRetain();
         try self.importScript(arena.allocator(), url);
     }
@@ -424,7 +420,7 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
     _ = ls.local.eval(response.body.items, url) catch |err| {
         self.page.recordJsError(err);
         const caught = try_catch.caughtOrError(arena, err);
-        log.debug(.browser, "importScript", .{ .url = resolved_url, .caught = caught });
+        log.warn(.page_error, "uncaught exception", .{ .url = resolved_url, .caught = caught });
         return;
     };
 
@@ -443,13 +439,19 @@ pub fn reportError(self: *WorkerGlobalScope, err: JS.Value) !void {
     defer self.js.call_depth = call_depth;
 
     self.page.recordJsError(error.JsException);
+    self.page.status.noteException(err.toStringSlice() catch "");
 
     self._reporting_error = true;
     defer self._reporting_error = false;
 
+    const location = err.errorLocation(err.local.call_arena) catch JS.Value.ErrorLocation{};
+
     const error_event = try ErrorEvent.initTrusted(comptime .wrap("error"), .{
         .@"error" = try err.persist(),
         .message = err.toStringSlice() catch "Unknown error",
+        .filename = location.url,
+        .lineno = location.line,
+        .colno = location.column,
         .bubbles = false,
         .cancelable = true,
     }, self.page);
@@ -462,15 +464,13 @@ pub fn reportError(self: *WorkerGlobalScope, err: JS.Value) !void {
     // onerror is called with the event's fields (see Listener.run).
     try self.dispatch(self.asEventTarget(), event, .{});
 
-    if (comptime lp.IS_TEST == false) {
-        if (!event._prevent_default) {
-            log.debug(.js, "worker.reportError", .{
-                .message = error_event._message,
-                .filename = error_event._filename,
-                .line_number = error_event._line_number,
-                .column_number = error_event._column_number,
-            });
-        }
+    if (!event._prevent_default) {
+        log.warn(.page_error, "uncaught exception", .{
+            .message = error_event._message,
+            .url = error_event._filename,
+            .line = error_event._line_number,
+            .column = error_event._column_number,
+        });
     }
 }
 
@@ -482,11 +482,11 @@ fn queueMicrotask(self: *WorkerGlobalScope, cb: JS.Function) void {
     self.js.queueMicrotaskFunc(cb);
 }
 
-pub fn setTimeout(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []JS.Value.Global, exec: *JS.Execution) !u32 {
+pub fn setTimeout(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: JS.Variadic(JS.Value.Global), exec: *JS.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = false,
-        .params = params,
+        .params = params.values,
         .name = "worker.setTimeout",
     });
 }
@@ -495,11 +495,11 @@ fn clearTimeout(self: *WorkerGlobalScope, id: u32) void {
     self._timers.clear(id);
 }
 
-pub fn setInterval(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []JS.Value.Global, exec: *JS.Execution) !u32 {
+pub fn setInterval(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: JS.Variadic(JS.Value.Global), exec: *JS.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = true,
-        .params = params,
+        .params = params.values,
         .name = "worker.setInterval",
     });
 }

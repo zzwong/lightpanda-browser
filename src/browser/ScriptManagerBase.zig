@@ -729,6 +729,7 @@ pub const Script = struct {
         const self: *Script = @ptrCast(@alignCast(transfer.req.ctx));
 
         self.status = transfer.responseStatus().?;
+        self.manager.owner.pageStatus().noteResponse(.script, transfer);
         if (transfer.responseStatus() != 200) {
             log.info(.http, "script header", .{
                 .req = transfer,
@@ -841,6 +842,9 @@ pub const Script = struct {
 
     pub fn errorCallback(ctx: *anyopaque, err: anyerror) void {
         const self: *Script = @ptrCast(@alignCast(ctx));
+        if (self.status == 0) {
+            self.manager.owner.pageStatus().noteError(.script, err);
+        }
         if (self.status == 404) {
             log.info(.http, "script 404", .{
                 .req = self.url,
@@ -1011,17 +1015,21 @@ pub const Script = struct {
             return;
         }
 
-        const caught = try_catch.caughtOrError(frame.local_arena, error.Unknown);
         lp.metrics.script_errors.incr();
-        log.debug(.js, "eval script", .{
-            .url = url,
-            .caught = caught,
-        });
 
+        // Report before caughtOrError: reading the exception's stack drops
+        // the frames reportError needs for the error's location.
         if (try_catch.exceptionValue()) |exc| {
             frame.window.reportError(exc, frame) catch |err| {
                 log.debug(.js, "eval script report error", .{ .url = url, .err = err });
             };
+        }
+
+        if (log.enabled(.js, .debug)) {
+            log.debug(.js, "eval script", .{
+                .url = url,
+                .caught = try_catch.caughtOrError(frame.local_arena, error.Unknown),
+            });
         }
 
         // a classic script that throws is still "loaded". For a module, we can't

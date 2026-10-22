@@ -78,7 +78,7 @@ const Filters = union(Mode) {
     selected_options,
     links,
     anchors,
-    form: struct { form: *Form, form_id: ?[]const u8, image_buttons: bool, outputs: bool },
+    form: struct { form: *Form, form_id: ?[]const u8, image_buttons: bool, outputs: bool, listed: bool },
     document_named: []const u8,
 
     fn TypeOf(comptime mode: Mode) type {
@@ -212,8 +212,8 @@ pub fn NodeLive(comptime mode: Mode) type {
             return null;
         }
 
-        pub fn getByName(self: *Self, name: []const u8, frame: *Frame) ?*Element {
-            if (frame.getElementByIdFromNode(self._tw._root, name)) |element| {
+        pub fn getByName(self: *Self, name: []const u8) ?*Element {
+            if (Frame.getElementByIdFromNode(self._tw._root, name)) |element| {
                 const node = element.asNode();
                 if (self._tw.contains(node) and self.matches(node)) {
                     return element;
@@ -370,7 +370,14 @@ pub fn NodeLive(comptime mode: Mode) type {
                 },
                 .form => {
                     const el = node.is(Element) orelse return false;
-                    const is_control = isFormControl(el) or (self._filter.outputs and el.getTag() == .output);
+                    if (el._type != .html) {
+                        return false;
+                    }
+                    const is_control = isFormControl(el) or switch (el.getTag()) {
+                        .output => self._filter.outputs or self._filter.listed,
+                        .fieldset, .object => self._filter.listed,
+                        else => false,
+                    };
                     if (is_control == false) {
                         return false;
                     }
@@ -416,7 +423,6 @@ pub fn NodeLive(comptime mode: Mode) type {
         }
 
         fn isFormControl(el: *Element) bool {
-            if (el._type != .html) return false;
             const html = el.subtype(Element.Html);
             return switch (html._type) {
                 .input, .button, .select, .textarea => true,

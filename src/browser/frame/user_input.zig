@@ -32,7 +32,6 @@ const js = @import("../js/js.zig");
 const Node = @import("../webapi/Node.zig");
 const Event = @import("../webapi/Event.zig");
 const Element = @import("../webapi/Element.zig");
-const ShadowRoot = @import("../webapi/ShadowRoot.zig");
 const TreeWalker = @import("../webapi/TreeWalker.zig");
 const TextEvent = @import("../webapi/event/TextEvent.zig");
 const InputEvent = @import("../webapi/event/InputEvent.zig");
@@ -170,13 +169,13 @@ fn dispatchBoundaryEvents(frame: *Frame, from: ?*Element, to: ?*Element, emitter
     const pivot: ?*Node = blk: {
         const a = from orelse break :blk null;
         const b = to orelse break :blk null;
-        break :blk commonAncestor(a.asNode(), b.asNode());
+        break :blk commonAncestor(a.asNode(), b.asNode(), frame);
     };
 
     if (from) |old| {
         emitter.emit(frame, old, "out", to, true);
         var current: ?*Node = old.asNode();
-        while (current) |node| : (current = shadowIncludingParent(node)) {
+        while (current) |node| : (current = node.flatTreeParent(frame)) {
             if (node == pivot) {
                 break;
             }
@@ -194,7 +193,7 @@ fn dispatchBoundaryEvents(frame: *Frame, from: ?*Element, to: ?*Element, emitter
         // reach each one from the deepest ancestor down.
         var count: usize = 0;
         var current: ?*Node = new.asNode();
-        while (current) |node| : (current = shadowIncludingParent(node)) {
+        while (current) |node| : (current = node.flatTreeParent(frame)) {
             if (node == pivot) {
                 break;
             }
@@ -205,7 +204,7 @@ fn dispatchBoundaryEvents(frame: *Frame, from: ?*Element, to: ?*Element, emitter
         while (count > 0) : (count -= 1) {
             var remaining = count;
             current = new.asNode();
-            while (current) |node| : (current = shadowIncludingParent(node)) {
+            while (current) |node| : (current = node.flatTreeParent(frame)) {
                 const element = node.is(Element) orelse continue;
                 remaining -= 1;
                 if (remaining == 0) {
@@ -433,39 +432,35 @@ pub const PointerButtons = struct {
     }
 };
 
-// Native targets can be inside a shadow tree. Boundary paths and click
-// ancestry include its host, without introducing slot-distribution semantics.
-fn shadowIncludingParent(node: *Node) ?*Node {
-    if (node.is(ShadowRoot)) |root| return root._host.asNode();
-    return node.parentNode();
-}
-
-fn commonAncestor(a: *Node, b: *Node) ?*Node {
+/// The nearest common inclusive ancestor in the flat tree, where a shadow
+/// tree sits inside its host, as hit-testing sees it.
+fn commonAncestor(a: *Node, b: *Node, frame: *const Frame) ?*Node {
     var current: ?*Node = a;
-    while (current) |node| : (current = shadowIncludingParent(node)) {
+    while (current) |node| : (current = node.flatTreeParent(frame)) {
         var other: ?*Node = b;
-        while (other) |candidate| : (other = shadowIncludingParent(candidate)) {
-            if (node == candidate) return node;
+        while (other) |candidate| : (other = candidate.flatTreeParent(frame)) {
+            if (node == candidate) {
+                return node;
+            }
         }
     }
     return null;
 }
 
 /// A click whose mousedown and mouseup landed on different elements fires at
-/// their nearest common inclusive ancestor element. The input API currently
-/// requires an Element: when the DOM common ancestor is a ShadowRoot, using
-/// its host preserves the prior host-facing behavior instead of clicking the
-/// released sibling. This is a compatibility fallback, not full EventTarget
-/// click dispatch parity (which would target the ShadowRoot itself).
+/// their nearest common inclusive ancestor element. Two nodes of one shadow
+/// tree meet at its shadow root, which isn't an element: the host is.
 fn commonClickTarget(frame: *Frame, down: *Element, up: *Element) ?*Element {
     const owner = down.ownerFrame(frame) orelse return null;
     if (up.ownerFrame(frame) != owner) return null;
     if (down == up) {
         return up;
     }
-    var current = commonAncestor(down.asNode(), up.asNode());
-    while (current) |ancestor| : (current = shadowIncludingParent(ancestor)) {
-        if (ancestor.is(Element)) |element| return element;
+    var current = commonAncestor(down.asNode(), up.asNode(), frame);
+    while (current) |ancestor| : (current = ancestor.flatTreeParent(frame)) {
+        if (ancestor.is(Element)) |element| {
+            return element;
+        }
     }
     return up;
 }
@@ -569,18 +564,14 @@ const MouseHit = struct {
 };
 
 /// Input coordinates start in the caller's viewport. Unlike the DOM API,
-/// native hit testing descends into hosted shadow trees and hit iframe documents.
+/// native hit testing descends into the hit iframe's document.
 fn mouseHitTest(frame: *Frame, x: f64, y: f64) !MouseHit {
-    return mouseHitTestImpl(frame, x, y, true);
-}
-
-fn mouseHitTestImpl(frame: *Frame, x: f64, y: f64, shadow_trees: bool) !MouseHit {
     var hit: MouseHit = .{ .frame = frame, .target = null, .x = x, .y = y };
     if (frame.window._closed) {
         return hit;
     }
     const viewport = frame.page.getViewport();
-    hit.target = try documentHit(frame, x, y, @floatFromInt(viewport.width), @floatFromInt(viewport.height), shadow_trees);
+    hit.target = try documentHit(frame, x, y, @floatFromInt(viewport.width), @floatFromInt(viewport.height));
     while (hit.target) |target| {
         const iframe = target.is(Element.Html.IFrame) orelse break;
         const window = iframe._window orelse break;
@@ -596,7 +587,7 @@ fn mouseHitTestImpl(frame: *Frame, x: f64, y: f64, shadow_trees: bool) !MouseHit
         if (!inBox(child_x, child_y, width, height)) break;
         hit = .{
             .frame = child,
-            .target = try documentHit(child, child_x, child_y, width, height, shadow_trees),
+            .target = try documentHit(child, child_x, child_y, width, height),
             .x = child_x,
             .y = child_y,
         };
@@ -606,9 +597,8 @@ fn mouseHitTestImpl(frame: *Frame, x: f64, y: f64, shadow_trees: bool) !MouseHit
 
 /// Like Chrome, a point inside the viewport that no element box covers lands
 /// on the root element, unless the root itself can't be hit.
-fn documentHit(frame: *Frame, x: f64, y: f64, width: f64, height: f64, shadow_trees: bool) !?*Element {
-    if (try frame.document.elementFromPoint(x, y, frame)) |target| {
-        if (shadow_trees) return shadowHit(frame, target, x, y);
+fn documentHit(frame: *Frame, x: f64, y: f64, width: f64, height: f64) !?*Element {
+    if (try frame.document.hitTest(x, y, frame)) |target| {
         return target;
     }
     if (!inBox(x, y, width, height)) {
@@ -620,39 +610,6 @@ fn documentHit(frame: *Frame, x: f64, y: f64, width: f64, height: f64, shadow_tr
         return null;
     }
     return root;
-}
-
-/// The DOM API exposes the host; native input must reach the inner target.
-/// Shadow rectangles, including nested hosts, are already viewport-relative.
-/// Do not subtract the host origin again or reuse the document preorder.
-fn shadowHit(frame: *Frame, initial: *Element, x: f64, y: f64) !*Element {
-    var target = initial;
-    const style_manager = &frame._style_manager;
-    const Entry = struct { node: *Node, hidden: bool };
-    var stack: std.ArrayList(Entry) = .empty;
-    while (target.hostedShadowRoot(frame)) |root| {
-        var inner: ?*Element = null;
-        try stack.append(frame.local_arena, .{ .node = root.asNode(), .hidden = false });
-        while (stack.pop()) |entry| {
-            var hidden = entry.hidden;
-            if (entry.node.is(Element)) |element| {
-                hidden = hidden or style_manager.hasDisplayNone(element);
-                if (!hidden and style_manager.isHitTestable(element)) {
-                    const rect = element.boundingClientRectValuesForVisible(frame);
-                    if (inBox(x - rect.x, y - rect.y, rect.width, rect.height)) {
-                        inner = element;
-                    }
-                }
-            }
-            // Hidden nodes still have positions, but cannot be targets.
-            var child = entry.node.lastChild();
-            while (child) |node| : (child = node.previousSibling()) {
-                try stack.append(frame.local_arena, .{ .node = node, .hidden = hidden });
-            }
-        }
-        target = inner orelse break;
-    }
-    return target;
 }
 
 fn inBox(x: f64, y: f64, width: f64, height: f64) bool {
@@ -765,9 +722,7 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
 }
 
 pub fn triggerMouseWheel(frame: *Frame, x: f64, y: f64, delta_x: f64, delta_y: f64) !void {
-    // Preserve host-facing wheel routing: its scroll-container walk still
-    // uses ordinary DOM parents. Shadow-aware wheel routing is separate.
-    const hit = try mouseHitTestImpl(frame, x, y, false);
+    const hit = try mouseHitTest(frame, x, y);
     const target = hit.target orelse blk: {
         // Over an iframe whose document takes nothing, the wheel goes nowhere.
         // A top-level miss still scrolls the root.
@@ -845,7 +800,7 @@ fn scrollAxis(target: *Element, comptime axis: Element.Axis, delta: i32, frame: 
         if (container.containsOverscroll(axes, frame)) {
             return;
         }
-        current = container.parentElement();
+        current = container.asNode().flatTreeParentElement(frame);
     }
 
     const opts: Element.ScrollToOpts = switch (axis) {
@@ -994,7 +949,7 @@ pub fn touchStart(frame: *Frame, target: ?*Element, point: Touch.Point, modifier
     }
     const owner = if (target) |el| el.ownerFrame(frame) orelse frame else frame;
     const resolved = target orelse
-        (try owner.window._document.elementFromPoint(point.x, point.y, owner)) orelse
+        (try owner.window._document.hitTest(point.x, point.y, owner)) orelse
         owner.window._document.getDocumentElement() orelse return;
     if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame touch", .{
@@ -1155,7 +1110,7 @@ pub fn touchCancel(frame: *Frame, modifiers: Modifiers) !void {
 
 fn touchCompatTarget(frame: *Frame, point: Touch.Point, pinned: ?*Element) !?*Element {
     if (pinned) |el| return el;
-    return frame.window._document.elementFromPoint(point.x, point.y, frame);
+    return frame.window._document.hitTest(point.x, point.y, frame);
 }
 
 /// Drops the page's input state on `frame`'s elements, which are going away.
@@ -1360,13 +1315,13 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
                 if (element.isDisabled()) {
                     return;
                 }
-                return frame.submitForm(element, input.getForm(frame), .{});
+                return frame.submitForm(element, input.getForm(), .{});
             }
             if (input._input_type == .reset) {
                 if (element.isDisabled()) {
                     return;
                 }
-                const form = input.getForm(frame) orelse return;
+                const form = input.getForm() orelse return;
                 return form.reset(frame);
             }
         },
@@ -1376,13 +1331,13 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
                 if (element.isDisabled()) {
                     return;
                 }
-                return frame.submitForm(element, button.getForm(frame), .{});
+                return frame.submitForm(element, button.getForm(), .{});
             }
             if (std.mem.eql(u8, button.getType(), "reset")) {
                 if (element.isDisabled()) {
                     return;
                 }
-                const form = button.getForm(frame) orelse return;
+                const form = button.getForm() orelse return;
                 return form.reset(frame);
             }
         },
@@ -1391,7 +1346,7 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
             // Per HTML §4.10.4 "The label element", a label's activation
             // behavior is to run the synthetic click activation steps on the
             // labeled control. Mirrors Chrome's HTMLLabelElement::DefaultEventHandler.
-            const control = label.getControl(frame) orelse return;
+            const control = label.getControl() orelse return;
             if (control.asNode().contains(event_target)) {
                 // label is the only control that synthesizes another click, so
                 // we need to guard against that activation re-triggering the
@@ -1564,7 +1519,7 @@ pub fn typeChar(frame: *Frame, target: *Element, keypress: *KeyboardEvent, text:
 /// form submits itself (SubmitEvent.submitter is null).
 /// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#implicit-submission
 fn implicitFormSubmission(frame: *Frame, input: *Element.Html.Input) !void {
-    const form = input.getForm(frame) orelse return;
+    const form = input.getForm() orelse return;
     if (form.getDefaultButton(frame)) |button| {
         if (button.isDisabled()) {
             return;
@@ -1603,6 +1558,10 @@ pub fn handleKeydown(frame: *Frame, target: *Node, event: *Event) !void {
     if (key == .Tab) {
         // tab -> forward, shift+tab -> backwards
         return moveFocus(frame, keyboard_event.getShiftKey() == false);
+    }
+
+    if (key == .Escape) {
+        return Element.Html.Dialog.requestCloseTopModal(frame);
     }
 
     if (key == .Enter) {
@@ -2016,7 +1975,7 @@ test "user_input: mouse hit testing descends nested iframe viewports" {
     const main = page.frame().?;
     const child = main.child_frames.items[0];
     const nested = child.child_frames.items[0];
-    const target = nested.document.getElementById("inner", nested).?;
+    const target = nested.document.getElementById("inner").?;
     const rect = target.boundingClientRectValues(nested);
     const child_rect = child.iframe.?.asElement().boundingClientRectValues(main);
     const nested_rect = nested.iframe.?.asElement().boundingClientRectValues(child);
@@ -2024,7 +1983,7 @@ test "user_input: mouse hit testing descends nested iframe viewports" {
     const y = rect.y + nested_rect.y + child_rect.y + 1;
 
     // The DOM API intentionally returns the iframe in the calling document.
-    try testing.expect((try main.document.elementFromPoint(x, y, main)) == child.iframe.?.asElement());
+    try testing.expect((try main.document.hitTest(x, y, main)) == child.iframe.?.asElement());
     var ls: js.Local.Scope = undefined;
     nested.js.localScope(&ls);
     defer ls.deinit();
@@ -2053,8 +2012,8 @@ test "user_input: mouse release in another document does not click" {
     const main = page.frame().?;
     const child = main.child_frames.items[0];
     const nested = child.child_frames.items[0];
-    const inner = nested.document.getElementById("inner", nested).?;
-    const outer = main.document.getElementById("outer", main).?;
+    const inner = nested.document.getElementById("inner").?;
+    const outer = main.document.getElementById("outer").?;
     const inner_rect = inner.boundingClientRectValues(nested);
     const child_rect = child.iframe.?.asElement().boundingClientRectValues(main);
     const nested_rect = nested.iframe.?.asElement().boundingClientRectValues(child);
@@ -2075,11 +2034,11 @@ test "user_input: a blank viewport point hovers the root; only leaving the viewp
     const page = try testing.pageTest("input_mouse_frames.html", .{});
     defer page.close();
     const main = page.frame().?;
-    const outer = main.document.getElementById("outer", main).?;
+    const outer = main.document.getElementById("outer").?;
     const rect = outer.boundingClientRectValues(main);
     const viewport = main.page.getViewport();
     const blank_y: f64 = @floatFromInt(viewport.height - 1);
-    try testing.expect((try main.document.elementFromPoint(1, blank_y, main)) == null);
+    try testing.expect((try main.document.hitTest(1, blank_y, main)) == null);
 
     var ls: js.Local.Scope = undefined;
     main.js.localScope(&ls);
@@ -2112,7 +2071,7 @@ test "user_input: removing hit iframe in pointerdown stops its mouse sequence" {
     defer page.close();
     const main = page.frame().?;
     const child = main.child_frames.items[0];
-    const target = child.document.getElementById("middle", child).?;
+    const target = child.document.getElementById("middle").?;
     const rect = target.boundingClientRectValues(child);
     const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
     var ls: js.Local.Scope = undefined;
@@ -2124,7 +2083,7 @@ test "user_input: removing hit iframe in pointerdown stops its mouse sequence" {
         \\childInput.addEventListener('pointerdown', e => { e.preventDefault(); events.push('pointerdown'); document.getElementById('child').remove(); });
         \\for (const type of ['mousedown', 'focus', 'mouseup', 'click']) childInput.addEventListener(type, () => events.push(type));
     , null);
-    try testing.expect((try main.document.elementFromPoint(rect.x + iframe_rect.x + 1, rect.y + iframe_rect.y + 1, main)) == child.iframe.?.asElement());
+    try testing.expect((try main.document.hitTest(rect.x + iframe_rect.x + 1, rect.y + iframe_rect.y + 1, main)) == child.iframe.?.asElement());
     try triggerMousePress(main, rect.x + iframe_rect.x + 1, rect.y + iframe_rect.y + 1, mouse_button.main, 1);
     try testing.expect((try ls.local.compileAndRun("events.join(',') === 'pointerdown'", null)).isTrue());
     try testing.expect(child.window._closed);
@@ -2167,8 +2126,8 @@ test "user_input: an excluded child document root is not a mouse target" {
 
     for ([_][]const u8{ "display: none", "pointer-events: none" }) |style| {
         try root.setStyle(style, child);
-        try testing.expect((try main.document.elementFromPoint(x, y, main)) == iframe);
-        try testing.expect((try child.document.elementFromPoint(1, 1, child)) == null);
+        try testing.expect((try main.document.hitTest(x, y, main)) == iframe);
+        try testing.expect((try child.document.hitTest(1, 1, child)) == null);
 
         try triggerMouseMove(main, x, y);
         try triggerMousePress(main, x, y, mouse_button.main, 1);
@@ -2199,8 +2158,8 @@ test "user_input: mouse hit testing still enters a blank child document" {
     _ = try ls.local.compileAndRun("document.documentElement.replaceChildren()", null);
 
     const hit = try mouseHitTest(main, x, y);
-    try testing.expect((try main.document.elementFromPoint(x, y, main)) == iframe.asElement());
-    try testing.expect((try child.document.elementFromPoint(1, 1, child)) == null);
+    try testing.expect((try main.document.hitTest(x, y, main)) == iframe.asElement());
+    try testing.expect((try child.document.hitTest(1, 1, child)) == null);
     try testing.expect(hit.frame == child);
     try testing.expect(hit.target == child.document.getDocumentElement().?);
 
@@ -2228,7 +2187,7 @@ test "user_input: excluded child roots clear hover without releasing held button
             const main = page.frame().?;
             const child = main.child_frames.items[0];
             const owner = if (from_child) child else main;
-            const target = owner.document.getElementById(if (from_child) "middle" else "outer", owner).?;
+            const target = owner.document.getElementById(if (from_child) "middle" else "outer").?;
             const rect = target.boundingClientRectValues(owner);
             const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
             const x = rect.x + (if (from_child) iframe_rect.x else @as(f64, 0)) + 1;
@@ -2248,7 +2207,7 @@ test "user_input: excluded child roots clear hover without releasing held button
             try testing.expect(main.page.input_hover_target == target);
             const root = child.document.getDocumentElement().?;
             try root.setStyle(style, child);
-            try testing.expect((try child.document.elementFromPoint(1, 1, child)) == null);
+            try testing.expect((try child.document.hitTest(1, 1, child)) == null);
             try triggerMouseMove(main, iframe_rect.x + 1, iframe_rect.y + 1);
             try testing.expect(main.page.input_hover_target == null);
             try testing.expectEqual(1, main.page.input_pointer.held);
@@ -2273,8 +2232,8 @@ test "user_input: removing a pressed iframe between messages clears pointer stat
     defer page.close();
     const main = page.frame().?;
     const child = main.child_frames.items[0];
-    const target = child.document.getElementById("middle", child).?;
-    const outer = main.document.getElementById("outer", main).?;
+    const target = child.document.getElementById("middle").?;
+    const outer = main.document.getElementById("outer").?;
     const target_rect = target.boundingClientRectValues(child);
     const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
     const outer_rect = outer.boundingClientRectValues(main);
@@ -2357,14 +2316,14 @@ test "user_input: wheel listener removing its iframe prevents the scroll default
         , null);
     }
 
-    const box = child.document.getElementById("wheelBox", child).?;
+    const box = child.document.getElementById("wheelBox").?;
     const box_rect = box.boundingClientRectValues(child);
     const iframe_rect = child.iframe.?.asElement().boundingClientRectValues(main);
     const x = box_rect.x + iframe_rect.x + 1;
     const y = box_rect.y + iframe_rect.y + 1;
     try testing.expect(box.getScrollHeight(child) > box.getClientHeight(child));
     try testing.expectEqual(@as(u32, 0), box.getScrollTop(child));
-    const child_hit = (try child.document.elementFromPoint(box_rect.x + 1, box_rect.y + 1, child)).?;
+    const child_hit = (try child.document.hitTest(box_rect.x + 1, box_rect.y + 1, child)).?;
     try testing.expect(box.asNode().contains(child_hit.asNode()));
 
     try triggerMouseWheel(main, x, y, 0, 20);
@@ -2382,11 +2341,11 @@ test "user_input: mouse hover transitions cross nested iframe documents" {
     const child = main.child_frames.items[0];
     const nested = child.child_frames.items[0];
 
-    const outer = main.document.getElementById("outer", main).?;
+    const outer = main.document.getElementById("outer").?;
     const child_iframe = child.iframe.?.asElement();
-    const middle = child.document.getElementById("middle", child).?;
+    const middle = child.document.getElementById("middle").?;
     const nested_iframe = nested.iframe.?.asElement();
-    const inner = nested.document.getElementById("inner", nested).?;
+    const inner = nested.document.getElementById("inner").?;
     const outer_rect = outer.boundingClientRectValues(main);
     const child_rect = child_iframe.boundingClientRectValues(main);
     const middle_rect = middle.boundingClientRectValues(child);
@@ -2508,7 +2467,7 @@ test "user_input: mouse blank iframe takes document focus" {
     defer page.close();
     const main = page.frame().?;
     const child = main.child_frames.items[0];
-    const outer = main.document.getElementById("outer", main).?;
+    const outer = main.document.getElementById("outer").?;
     var ls: js.Local.Scope = undefined;
     child.js.localScope(&ls);
     defer ls.deinit();
@@ -2536,7 +2495,7 @@ test "user_input: mouse static nested iframe takes document focus" {
     nested.js.localScope(&ls);
     defer ls.deinit();
     _ = try ls.local.compileAndRun("document.body.innerHTML = '<div style=width:150px;height:150px>static</div>';", null);
-    try main.document.getElementById("outer", main).?.focus(main);
+    try main.document.getElementById("outer").?.focus(main);
     const child_rect = child.iframe.?.asElement().boundingClientRectValues(main);
     const nested_rect = nested.iframe.?.asElement().boundingClientRectValues(child);
     const x = child_rect.x + nested_rect.x + 10;
@@ -2554,7 +2513,7 @@ test "user_input: mouse blank iframe cancelled press preserves focus" {
         defer page.close();
         const main = page.frame().?;
         const child = main.child_frames.items[0];
-        const outer = main.document.getElementById("outer", main).?;
+        const outer = main.document.getElementById("outer").?;
         var ls: js.Local.Scope = undefined;
         child.js.localScope(&ls);
         defer ls.deinit();
@@ -2577,7 +2536,7 @@ test "user_input: mouse removed blank iframe does not take focus" {
         defer page.close();
         const main = page.frame().?;
         const child = main.child_frames.items[0];
-        const outer = main.document.getElementById("outer", main).?;
+        const outer = main.document.getElementById("outer").?;
         var ls: js.Local.Scope = undefined;
         main.js.localScope(&ls);
         defer ls.deinit();
@@ -2604,7 +2563,7 @@ test "user_input: mouse blank sibling iframe clears old focus chain" {
     const main = page.frame().?;
     const child = main.child_frames.items[0];
     const sibling = main.child_frames.items[1];
-    const middle = child.document.getElementById("middle", child).?;
+    const middle = child.document.getElementById("middle").?;
     var ls: js.Local.Scope = undefined;
     main.js.localScope(&ls);
     defer ls.deinit();
@@ -2632,7 +2591,7 @@ test "user_input: synthetic blank iframe click preserves focus" {
     const page = try testing.pageTest("input_mouse_frames.html", .{});
     defer page.close();
     const main = page.frame().?;
-    const outer = main.document.getElementById("outer", main).?;
+    const outer = main.document.getElementById("outer").?;
     try outer.focus(main);
     var ls: js.Local.Scope = undefined;
     main.js.localScope(&ls);
@@ -2649,7 +2608,7 @@ test "user_input: shadow mouse rects are viewport relative and native clicks rea
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
-    const host = frame.document.getElementById("host", frame).?;
+    const host = frame.document.getElementById("host").?;
     const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
     const host_rect = host.boundingClientRectValues(frame);
     const rect = inner.boundingClientRectValues(frame);
@@ -2657,7 +2616,6 @@ test "user_input: shadow mouse rects are viewport relative and native clicks rea
     try testing.expectEqual(host_rect.y + 5, rect.y);
     const x = rect.x + 1;
     const y = rect.y + 1;
-    try testing.expect((try frame.document.elementFromPoint(x, y, frame)) == host);
     try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
     try triggerMouseMove(frame, x, y);
     try triggerMousePress(frame, x, y, mouse_button.main, 1);
@@ -2675,12 +2633,12 @@ test "user_input: shadow mouse hit testing respects bounds and hidden descendant
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
-    const host = frame.document.getElementById("host", frame).?;
+    const host = frame.document.getElementById("host").?;
     const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
     const rect = inner.boundingClientRectValues(frame);
     try testing.expect((try mouseHitTest(frame, rect.x, rect.y)).target == inner);
-    try testing.expect((try mouseHitTest(frame, rect.x + rect.width, rect.y + 1)).target == host);
-    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height)).target == host);
+    try testing.expect((try mouseHitTest(frame, rect.x + rect.width + 1, rect.y + 1)).target == host);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height + 1)).target == host);
     try testing.expect((try mouseHitTest(frame, rect.x - 1, rect.y + 1)).target == host);
     for ([_][]const u8{ "pointer-events:none", "visibility:hidden", "display:none" }) |style| {
         try inner.setStyle(try std.fmt.allocPrint(frame.local_arena, "transform:translateX(20px);width:80px;height:60px;{s}", .{style}), frame);
@@ -2709,7 +2667,7 @@ test "user_input: shadow mouse nested closed roots and window scroll share coord
         \\deep.addEventListener('click', e => { if (e.isTrusted && e.target === deep) deepClicks++; });
         \\deep;
     , null));
-    const host = frame.document.getElementById("host", frame).?;
+    const host = frame.document.getElementById("host").?;
     const host_rect = host.boundingClientRectValues(frame);
     const before = target.boundingClientRectValues(frame);
     try testing.expectEqual(host_rect.x + 25, before.x);
@@ -2765,7 +2723,7 @@ test "user_input: shadow mouse keeps host boundary path and common click target"
             \\boundaryHost.addEventListener('click', e => clicks.push({where:'host', target:e.target.id, trusted:e.isTrusted, inner:e.composedPath().includes(boundaryInner)}));
             \\boundaryInner;
         , null));
-        const host = frame.document.getElementById("boundaryHost", frame).?;
+        const host = frame.document.getElementById("boundaryHost").?;
         const rect = inner.boundingClientRectValues(frame);
         const host_rect = host.boundingClientRectValues(frame);
         try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
@@ -2804,14 +2762,206 @@ test "user_input: shadow mouse wheel preserves outer scroll container" {
         \\inner;
     , null));
     const rect = inner.boundingClientRectValues(frame);
-    const scroller = frame.document.getElementById("scroller", frame).?;
+    const scroller = frame.document.getElementById("scroller").?;
     try testing.expect(scroller.getScrollHeight(frame) > scroller.getClientHeight(frame));
     try triggerMouseWheel(frame, rect.x + 1, rect.y + 1, 0, 20);
     try testing.expectEqual(@as(u32, 20), scroller.getScrollTop(frame));
     try testing.expectEqual(@as(u32, 0), frame.window.getScrollY());
 }
 
-test "user_input: shadow mouse sibling release uses Element-only host fallback" {
+test "user_input: shadow mouse press and release on shadow siblings clicks the host" {
+    const page = try testing.pageTest("input_mouse_shadow.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const other = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
+        \\const other = document.createElement('button');
+        \\other.style = 'width:50px;height:60px'; other.textContent = 'Other'; root.appendChild(other);
+        \\other.addEventListener('click', () => events.push({listener:'other'}));
+        \\other;
+    , null));
+    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
+    const start = inner.boundingClientRectValues(frame);
+    const end = other.boundingClientRectValues(frame);
+    try testing.expect((try mouseHitTest(frame, start.x + 1, start.y + 1)).target == inner);
+    try testing.expect((try mouseHitTest(frame, end.x + end.width - 1, end.y + 1)).target == other);
+    try triggerMousePress(frame, start.x + 1, start.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(frame, end.x + end.width - 1, end.y + 1, mouse_button.main, 1);
+    try testing.expect((try ls.local.compileAndRun("events.length === 1 && events[0].listener === 'host' && events[0].trusted", null)).isTrue());
+}
+
+test "user_input: retained fork shadow mouse rects are viewport relative and native clicks reach inner target" {
+    const page = try testing.pageTest("input_mouse_shadow.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const host = frame.document.getElementById("host").?;
+    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
+    const host_rect = host.boundingClientRectValues(frame);
+    const rect = inner.boundingClientRectValues(frame);
+    try testing.expectEqual(host_rect.x + 20, rect.x);
+    try testing.expectEqual(host_rect.y + 5, rect.y);
+    const x = rect.x + 1;
+    const y = rect.y + 1;
+    try testing.expect((try frame.document.elementFromPoint(x, y, frame)) == host);
+    try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
+    try triggerMouseMove(frame, x, y);
+    try triggerMousePress(frame, x, y, mouse_button.main, 1);
+    try triggerMouseRelease(frame, x, y, mouse_button.main, 1);
+    try testing.expect((try ls.local.compileAndRun(
+        \\events.length === 2 && events[0].listener === 'inner' && events[0].target === 'inner' &&
+        \\events[1].listener === 'host' && events[1].target === 'host' && events[1].inner && events.every(e => e.trusted)
+    , null)).isTrue());
+}
+
+test "user_input: retained fork shadow mouse hit testing respects bounds and hidden descendants" {
+    const page = try testing.pageTest("input_mouse_shadow.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const host = frame.document.getElementById("host").?;
+    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun("inner", null));
+    const rect = inner.boundingClientRectValues(frame);
+    try testing.expect((try mouseHitTest(frame, rect.x, rect.y)).target == inner);
+    try testing.expect((try mouseHitTest(frame, rect.x + rect.width, rect.y + 1)).target == host);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + rect.height)).target == host);
+    try testing.expect((try mouseHitTest(frame, rect.x - 1, rect.y + 1)).target == host);
+    for ([_][]const u8{ "pointer-events:none", "visibility:hidden", "display:none" }) |style| {
+        try inner.setStyle(try std.fmt.allocPrint(frame.local_arena, "transform:translateX(20px);width:80px;height:60px;{s}", .{style}), frame);
+        try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
+    }
+    _ = try ls.local.compileAndRun(
+        \\root.innerHTML = '<div style="display:none"><button style="width:100px;height:100px">Hidden</button></div>';
+    , null);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
+}
+
+test "user_input: retained fork shadow mouse nested closed roots and window scroll share coordinates" {
+    const page = try testing.pageTest("input_mouse_shadow.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const target = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
+        \\root.innerHTML = '<div id="nested" style="transform:translateX(10px);width:150px;height:150px"></div>';
+        \\const nested = root.getElementById('nested');
+        \\const closedRoot = nested.attachShadow({mode:'closed'});
+        \\closedRoot.innerHTML = '<button id="deep" style="transform:translateX(15px);width:60px;height:40px">Deep</button>';
+        \\const deep = closedRoot.getElementById('deep');
+        \\window.deepClicks = 0;
+        \\deep.addEventListener('click', e => { if (e.isTrusted && e.target === deep) deepClicks++; });
+        \\deep;
+    , null));
+    const host = frame.document.getElementById("host").?;
+    const host_rect = host.boundingClientRectValues(frame);
+    const before = target.boundingClientRectValues(frame);
+    try testing.expectEqual(host_rect.x + 25, before.x);
+    try testing.expectEqual(host_rect.y + 10, before.y);
+    _ = try ls.local.compileAndRun("document.body.style.width = '3000px'; document.body.style.height = '3000px'; window.scrollTo(30, 10)", null);
+    const rect = target.boundingClientRectValues(frame);
+    try testing.expectEqual(before.x - 30, rect.x);
+    try testing.expectEqual(before.y - 10, rect.y);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == target);
+    try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try testing.expect((try ls.local.compileAndRun("deepClicks === 1 && nested.shadowRoot === null", null)).isTrue());
+    _ = try ls.local.compileAndRun("nested.style.display = 'none'", null);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
+}
+
+test "user_input: retained fork shadow mouse descendants can override inherited hit exclusions" {
+    const page = try testing.pageTest("input_mouse_shadow.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const target = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
+        \\root.innerHTML = '<div style="pointer-events:none;visibility:hidden;width:150px;height:150px"><button id="enabled" style="pointer-events:auto;visibility:visible;width:60px;height:40px">Enabled</button></div>';
+        \\root.getElementById('enabled');
+    , null));
+    const rect = target.boundingClientRectValues(frame);
+    try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == target);
+}
+
+test "user_input: retained fork shadow mouse keeps host boundary path and common click target" {
+    for ([_][]const u8{ "open", "closed" }) |mode| {
+        const page = try testing.pageTest("input_mouse_shadow.html", .{});
+        defer page.close();
+        const frame = page.frame().?;
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.compileAndRun(try std.fmt.allocPrint(frame.local_arena, "window.boundaryMode = '{s}'", .{mode}), null);
+        const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
+            \\document.body.innerHTML = '<div id="boundaryHost" style="transform:translateX(80px);width:200px;height:200px"></div>';
+            \\const boundaryHost = document.getElementById('boundaryHost');
+            \\const boundaryRoot = boundaryHost.attachShadow({mode:boundaryMode});
+            \\boundaryRoot.innerHTML = '<button id="boundaryInner" style="transform:translateX(20px);width:80px;height:60px">Inner</button>';
+            \\const boundaryInner = boundaryRoot.getElementById('boundaryInner');
+            \\window.enters = []; window.leaves = []; window.clicks = [];
+            \\boundaryHost.addEventListener('mouseenter', () => enters.push('mouse'));
+            \\boundaryHost.addEventListener('pointerenter', () => enters.push('pointer'));
+            \\boundaryHost.addEventListener('mouseleave', () => leaves.push('mouse'));
+            \\boundaryHost.addEventListener('pointerleave', () => leaves.push('pointer'));
+            \\boundaryInner.addEventListener('click', e => clicks.push({where:'inner', target:e.target.id, trusted:e.isTrusted}));
+            \\boundaryHost.addEventListener('click', e => clicks.push({where:'host', target:e.target.id, trusted:e.isTrusted, inner:e.composedPath().includes(boundaryInner)}));
+            \\boundaryInner;
+        , null));
+        const host = frame.document.getElementById("boundaryHost").?;
+        const rect = inner.boundingClientRectValues(frame);
+        const host_rect = host.boundingClientRectValues(frame);
+        try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
+        try testing.expect((try ls.local.compileAndRun("enters.join(',') === 'pointer,mouse' && leaves.length === 0", null)).isTrue());
+        // Moving within the host does not leave or re-enter it.
+        try triggerMouseMove(frame, host_rect.x + 1, host_rect.y + 1);
+        try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
+        try testing.expect((try ls.local.compileAndRun("enters.length === 2 && leaves.length === 0", null)).isTrue());
+        try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try testing.expect((try ls.local.compileAndRun(
+            \\clicks.length === 2 && clicks[0].where === 'inner' && clicks[0].target === 'boundaryInner' &&
+            \\clicks[1].where === 'host' && clicks[1].target === 'boundaryHost' &&
+            \\clicks[1].inner === (boundaryMode === 'open') && clicks.every(e => e.trusted)
+        , null)).isTrue());
+        _ = try ls.local.compileAndRun("clicks = []", null);
+        try triggerMousePress(frame, host_rect.x + 1, host_rect.y + 1, mouse_button.main, 1);
+        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try testing.expect((try ls.local.compileAndRun("clicks.length === 1 && clicks[0].where === 'host' && clicks[0].trusted", null)).isTrue());
+        try triggerMouseMove(frame, -1, -1);
+        try testing.expect((try ls.local.compileAndRun("leaves.join(',') === 'pointer,mouse'", null)).isTrue());
+    }
+}
+
+test "user_input: retained fork shadow mouse wheel preserves outer scroll container" {
+    const page = try testing.pageTest("input_mouse_shadow.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const inner = try ls.local.jsValueToZig(*Element, try ls.local.compileAndRun(
+        \\const scroller = document.createElement('div');
+        \\scroller.id = 'scroller'; scroller.style = 'overflow:auto;width:400px;height:100px';
+        \\host.before(scroller); scroller.appendChild(host);
+        \\inner;
+    , null));
+    const rect = inner.boundingClientRectValues(frame);
+    const scroller = frame.document.getElementById("scroller").?;
+    try testing.expect(scroller.getScrollHeight(frame) > scroller.getClientHeight(frame));
+    try triggerMouseWheel(frame, rect.x + 1, rect.y + 1, 0, 20);
+    try testing.expectEqual(@as(u32, 20), scroller.getScrollTop(frame));
+    try testing.expectEqual(@as(u32, 0), frame.window.getScrollY());
+}
+
+test "user_input: retained fork shadow mouse sibling release uses Element-only host fallback" {
     const page = try testing.pageTest("input_mouse_shadow.html", .{});
     defer page.close();
     const frame = page.frame().?;

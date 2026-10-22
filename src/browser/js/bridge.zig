@@ -208,9 +208,8 @@ pub const Function = struct {
                 break;
             }
 
-            // A slice of js.Value is always bound as variadic (see
-            // Caller.getArgs) and variadics contribute 0 to length.
-            if (@typeInfo(PT) == .pointer and @typeInfo(PT).pointer.size == .slice and @typeInfo(PT).pointer.child == js.Value) {
+            // a rest parameter contributes 0 to length
+            if (@typeInfo(PT) == .@"struct" and @hasDecl(PT, "js_variadic")) {
                 break;
             }
             count += 1;
@@ -733,7 +732,7 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
     switch (local.ctx.global) {
         .frame => |frame| {
             const document = frame.document;
-            if (document.getElementById(property, frame)) |el| {
+            if (document.getElementById(property)) |el| {
                 const js_val = local.zigValueToJs(el, .{}) catch return js.Intercepted.no;
                 var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
                 pc.getReturnValue().set(js_val);
@@ -1310,6 +1309,20 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/webcodecs/AudioEncoder.zig"),
     @import("../webapi/webcodecs/VideoDecoder.zig"),
     @import("../webapi/webcodecs/VideoEncoder.zig"),
+    @import("../webapi/webaudio/AudioBuffer.zig"),
+    @import("../webapi/webaudio/AudioParam.zig"),
+    @import("../webapi/webaudio/PeriodicWave.zig"),
+    @import("../webapi/webaudio/BaseAudioContext.zig"),
+    @import("../webapi/webaudio/OfflineAudioContext.zig"),
+    @import("../webapi/webaudio/OfflineAudioCompletionEvent.zig"),
+    @import("../webapi/webaudio/AudioNode.zig"),
+    @import("../webapi/webaudio/AudioDestinationNode.zig"),
+    @import("../webapi/webaudio/AudioScheduledSourceNode.zig"),
+    @import("../webapi/webaudio/AudioBufferSourceNode.zig"),
+    @import("../webapi/webaudio/ConstantSourceNode.zig"),
+    @import("../webapi/webaudio/OscillatorNode.zig"),
+    @import("../webapi/webaudio/GainNode.zig"),
+    @import("../webapi/webaudio/DynamicsCompressorNode.zig"),
 });
 
 const webcodecs_apis = [_]type{
