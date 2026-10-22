@@ -730,3 +730,40 @@ test "Runner: networkidle waits out activity after the frame latched idle" {
     try again.waitForFrame(page.frame_id, 3000, .{ .until = .networkidle });
     try testing.expectEqual(true, lp.datetime.milliTimestamp(.boot) - again_start < 250);
 }
+
+
+test "Runner: fresh initial about blank advances timers and promise continuations" {
+    const page = try testing.test_session.createPage();
+    defer page.close();
+    const frame = page.frame().?;
+    try testing.expectEqual("about:blank", frame.url);
+    try testing.expectEqual(true, frame._parse_state == .pre);
+    try testing.expectEqual(true, frame._load_state == .waiting);
+    try testing.expectEqual(true, frame.document._ready_state == .complete);
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        try ls.local.eval(
+            \\globalThis.initialPageEvents = [];
+            \\setTimeout(() => {
+            \\  initialPageEvents.push('timer');
+            \\  Promise.resolve().then(() => initialPageEvents.push('promise'));
+            \\}, 0);
+        , null);
+    }
+    var runner = page.session.runner(.{});
+    var conditions: [0]WaitCondition = .{};
+    _ = try runner.tick(0, &conditions);
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        const events = try ls.local.exec("initialPageEvents.join(',')", null);
+        try testing.expectEqual("timer,promise", try events.toStringSlice());
+    }
+    try testing.expectEqual(true, frame._parse_state == .pre);
+    try testing.expectEqual(true, frame._load_state == .waiting);
+    try testing.expectEqual(true, frame.document._ready_state == .complete);
+}
