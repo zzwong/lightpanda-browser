@@ -358,7 +358,7 @@ fn sendMessageToTarget(cmd: *CDP.Command) !void {
         return error.TargetNotLoaded;
     }
     if (bc.attached_sessions.contains(params.sessionId) == false) {
-        return error.UnknownSessionId;
+        return cmd.sendError(-32602, "No session with given id", .{});
     }
 
     cmd.cdp.dispatch(cmd.arena, .{ .wrapped = .{
@@ -1687,5 +1687,43 @@ test "cdp.target: nested legacy attachment retains its effective parent" {
         }, .{});
         try ctx.cdp().sendEvent("Log.entryAdded", struct {}{}, .{ .session_id = child_id });
         try ctx.expectSentEvent("Target.receivedMessageFromTarget", .{ .sessionId = "SID-PARENT", .message = nested_event }, .{});
+    }
+}
+
+test "cdp.target: parent detachment retires descendants across context lifetime boundaries" {
+    const Operation = enum { detach, close, dispose };
+    inline for (.{ false, true }) |cross_context| {
+        inline for (.{ Operation.detach, Operation.close, Operation.dispose }) |operation| {
+            if (!cross_context and operation == .dispose) continue;
+            var ctx = try testing.context();
+            defer ctx.deinit();
+            const cdp = ctx.cdp();
+            const parent_bc = try ctx.loadBrowserContext(.{ .id = "BID-PARENT", .url = "hi.html", .target_id = "TID-000000000P".*, .session_id = "SID-PARENT" });
+            const parent_target = parent_bc.firstTarget().?;
+            const child_bc = if (cross_context) cdp.findBrowserContext(try cdp.createBrowserContext()).? else parent_bc;
+            _ = try child_bc.session.createPage();
+            const child_target = child_bc.targets.items[child_bc.targets.items.len - 1];
+            const child = try child_bc.attachSession(child_target, "SID-CHILD", "SID-PARENT");
+            child.flatten = false;
+            const grandchild = try child_bc.attachSession(child_target, "SID-GRANDCHILD", "SID-CHILD");
+            grandchild.flatten = false;
+            _ = try child_bc.attachSession(child_target, "SID-PEER", null);
+            switch (operation) {
+                .detach => try testing.expect(parent_bc.detachSession("SID-PARENT")),
+                .close => try parent_bc.closeTarget(parent_target),
+                .dispose => cdp.disposeContext(parent_bc),
+            }
+            try cdp.tick();
+            try testing.expectEqual(false, child_bc.attached_sessions.contains("SID-CHILD"));
+            try testing.expectEqual(false, child_bc.attached_sessions.contains("SID-GRANDCHILD"));
+            try testing.expect(child_bc.attached_sessions.contains("SID-PEER"));
+            try ctx.processMessage(.{ .id = 901, .method = "Target.sendMessageToTarget", .params = .{
+                .sessionId = "SID-CHILD",
+                .message = "{\"id\":902,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"42\"}}",
+            } });
+            try ctx.expectSentError(-32602, "No session with given id", .{ .id = 901 });
+            try ctx.processMessage(.{ .id = 903, .method = "Runtime.evaluate", .sessionId = "SID-PEER", .params = .{ .expression = "42", .returnByValue = true } });
+            try ctx.expectSentResult(.{ .result = .{ .type = "number", .value = 42 } }, .{ .id = 903, .session_id = "SID-PEER" });
+        }
     }
 }

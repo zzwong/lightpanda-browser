@@ -911,23 +911,44 @@ pub const BrowserContext = struct {
                 i += 1;
                 continue;
             }
-            self.attached_sessions.orderedRemoveAt(i);
-            self.destroySession(attached);
+            _ = self.detachSession(attached.id);
+            i = 0;
         }
         target.session_id = null;
     }
 
     pub fn detachAllSessions(self: *BrowserContext) void {
-        for (self.attached_sessions.values()) |attached| {
-            self.destroySession(attached);
+        while (self.attached_sessions.count() > 0) {
+            const attached = self.attached_sessions.values()[self.attached_sessions.count() - 1];
+            _ = self.detachSession(attached.id);
         }
-        self.attached_sessions.clearRetainingCapacity();
         for (self.targets.items) |target| {
             target.session_id = null;
         }
     }
 
+    fn detachChildSessions(self: *BrowserContext, parent_id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.attached_sessions.count()) {
+            const attached = self.attached_sessions.values()[i];
+            if (attached.parent_id) |id| {
+                if (std.mem.eql(u8, id, parent_id)) {
+                    _ = self.detachSession(attached.id);
+                    i = 0;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
     fn destroySession(self: *BrowserContext, attached: *AttachedSession) void {
+        // Parent routes can cross contexts; retire descendants before their id storage.
+        self.detachChildSessions(attached.id);
+        for (self.cdp.browser_contexts.items) |bc| {
+            if (bc != self) bc.detachChildSessions(attached.id);
+        }
+        attached.target.fetchDisableForSession(attached.id);
         self.notification.unregisterAll(attached);
         attached.inspector_session.deinit();
         self.cdp.allocator.destroy(attached);
