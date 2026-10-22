@@ -110,7 +110,7 @@ fn setDeviceMetricsOverride(cmd: *CDP.Command) !void {
 
     // The override is stored on the Browser so it persists across page
     // navigations for the whole CDP connection.
-    const browser = (cmd.browser_context orelse return error.BrowserContextNotLoaded).session;
+    const browser = &cmd.cdp.browser;
 
     // CDP convention: a 0 width/height means "don't override that dimension",
     // so keep the current value for any dimension passed as 0.
