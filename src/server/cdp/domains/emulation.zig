@@ -108,16 +108,14 @@ fn setDeviceMetricsOverride(cmd: *CDP.Command) !void {
         });
     }
 
-    // The override is stored on the Browser so it persists across page
-    // navigations for the whole CDP connection.
-    const browser = (cmd.browser_context orelse return error.BrowserContextNotLoaded).session;
+    const target = try cmd.target();
 
     // CDP convention: a 0 width/height means "don't override that dimension",
     // so keep the current value for any dimension passed as 0.
-    const current = browser.getViewport();
+    const current = target.getViewport();
     // Same convention for deviceScaleFactor: 0 means "don't override".
     const dsf: f32 = if (params.deviceScaleFactor) |v| @floatCast(v) else 0;
-    browser.setViewportOverride(.{
+    target.setViewportOverride(.{
         .width = if (params.width > 0) params.width else current.width,
         .height = if (params.height > 0) params.height else current.height,
         .scale = if (dsf > 0) dsf else current.scale,
@@ -129,7 +127,7 @@ fn setDeviceMetricsOverride(cmd: *CDP.Command) !void {
 }
 
 fn clearDeviceMetricsOverride(cmd: *CDP.Command) !void {
-    (cmd.browser_context orelse return error.BrowserContextNotLoaded).session.setViewportOverride(null);
+    (try cmd.target()).setViewportOverride(null);
     return cmd.sendResult(null, .{});
 }
 
@@ -157,7 +155,7 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     };
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const http_client = cmd.httpClient();
+    const http_client = (cmd.browser_context orelse return error.BrowserContextNotLoaded).session.http_client;
 
     // Applied even when the user agent is refused below: Playwright always
     // sends a Mozilla user agent alongside the locale it was asked for.
@@ -270,7 +268,7 @@ test "cdp.Emulation: viewport override fires matchMedia change events" {
     var ctx = try testing.context();
     defer ctx.deinit();
     var bc = try ctx.loadBrowserContext(.{ .id = "BID-MQL", .url = "hi.html", .target_id = "FID-0000000MQL".* });
-    const frame = bc.mainFrame() orelse unreachable;
+    const frame = bc.firstTarget().?.mainFrame() orelse unreachable;
 
     {
         var ls: js.Local.Scope = undefined;
@@ -301,7 +299,7 @@ test "cdp.Emulation: setDeviceMetricsOverride screenWidth/screenHeight reach win
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-SCR", .url = "hi.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -420,7 +418,7 @@ test "cdp.Emulation: setUserAgentOverride acceptLanguage drives navigator.langua
     var ctx = try testing.context();
     defer ctx.deinit();
     var bc = try ctx.loadBrowserContext(.{ .id = "BID-AL", .url = "hi.html", .target_id = "FID-00000000AL".* });
-    const frame = bc.mainFrame() orelse unreachable;
+    const frame = bc.firstTarget().?.mainFrame() orelse unreachable;
 
     // The default locale reaches both navigator and ICU.
     try expectJs(frame, "navigator.language === 'en-US' && navigator.languages.join() === 'en-US,en'");
@@ -497,7 +495,7 @@ test "cdp.Emulation: setDeviceMetricsOverride and clear" {
 
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-DM1" });
     _ = try bc.session.createPage();
-    const page = bc.mainPage().?;
+    const page = bc.firstTarget().?.mainPage().?;
 
     // Defaults to the compile-time viewport before any override.
     try testing.expectEqual(1920, page.getViewport().width);
@@ -513,10 +511,15 @@ test "cdp.Emulation: setDeviceMetricsOverride and clear" {
     try testing.expectEqual(375, page.getViewport().width);
     try testing.expectEqual(812, page.getViewport().height);
 
-    // The override lives on the Browser, so it persists across page
-    // navigations rather than being lost with the page.
-    try testing.expectEqual(375, bc.session.getViewport().width);
-    try testing.expectEqual(812, bc.session.getViewport().height);
+    const target = bc.firstTarget().?;
+    try testing.expectEqual(1920, bc.session.getViewport().width);
+    try testing.expectEqual(1080, bc.session.getViewport().height);
+    try testing.expectEqual(1920, bc.session.browser.getViewport().width);
+    try testing.expectEqual(1080, bc.session.browser.getViewport().height);
+    try target.pageHandle().?.navigate("http://127.0.0.1:9582/src/browser/tests/hi.html", .{});
+    try testing.waitForPage(bc);
+    try testing.expectEqual(375, target.mainPage().?.getViewport().width);
+    try testing.expectEqual(812, target.mainPage().?.getViewport().height);
 
     try ctx.processMessage(.{
         .id = 9,
@@ -524,8 +527,98 @@ test "cdp.Emulation: setDeviceMetricsOverride and clear" {
     });
 
     try ctx.expectSentResult(null, .{ .id = 9 });
-    try testing.expectEqual(1920, page.getViewport().width);
-    try testing.expectEqual(1080, page.getViewport().height);
+    try testing.expectEqual(1920, target.mainPage().?.getViewport().width);
+    try testing.expectEqual(1080, target.mainPage().?.getViewport().height);
+}
+
+test "cdp.Emulation: device metrics are isolated between page targets" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-VIEW", .url = "hi.html" });
+    const first = bc.firstTarget().?;
+    const second = try bc.createTarget();
+    _ = try bc.session.createPage();
+    _ = try second.attachPrimarySession("SID-PEER");
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Emulation.setDeviceMetricsOverride",
+        .sessionId = first.session_id.?,
+        .params = .{ .width = 321, .height = 543, .deviceScaleFactor = 2, .screenWidth = 800, .screenHeight = 900 },
+    });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Emulation.setDeviceMetricsOverride",
+        .sessionId = second.session_id.?,
+        .params = .{ .width = 987, .height = 654, .deviceScaleFactor = 3 },
+    });
+    try testing.expectEqual(321, first.mainPage().?.getViewport().width);
+    try testing.expectEqual(2, first.mainPage().?.getViewport().scale);
+    try testing.expectEqual(987, second.mainPage().?.getViewport().width);
+    try testing.expectEqual(3, second.mainPage().?.getViewport().scale);
+    try testing.expectEqual(1920, bc.session.browser.getViewport().width);
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Emulation.setDeviceMetricsOverride",
+        .sessionId = first.session_id.?,
+        .params = .{ .width = 0, .height = 600, .deviceScaleFactor = 0, .screenWidth = 0, .screenHeight = 0 },
+    });
+    const viewport = first.mainPage().?.getViewport();
+    try testing.expectEqual(321, viewport.width);
+    try testing.expectEqual(600, viewport.height);
+    try testing.expectEqual(2, viewport.scale);
+    try testing.expectEqual(800, viewport.screen_width.?);
+    try testing.expectEqual(900, viewport.screen_height.?);
+
+    try ctx.processMessage(.{ .id = 4, .method = "Emulation.clearDeviceMetricsOverride", .sessionId = first.session_id.? });
+    try testing.expectEqual(1920, first.mainPage().?.getViewport().width);
+    try testing.expectEqual(987, second.mainPage().?.getViewport().width);
+    try ctx.processMessage(.{ .id = 5, .method = "Page.getLayoutMetrics", .sessionId = second.session_id.? });
+    try ctx.expectSentResult(.{ .cssLayoutViewport = .{ .clientWidth = 987, .clientHeight = 654 } }, .{ .id = 5, .session_id = second.session_id.? });
+}
+
+test "cdp.Emulation: resizing updates conditional stylesheet rules" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .url = "hi.html" });
+    const frame = bc.firstTarget().?.mainFrame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.exec(
+        \\const style = document.createElement('style');
+        \\style.textContent = '#probe { width:50vw; height:20px } @media (min-width:600px) { #probe { height:40px } }';
+        \\document.head.appendChild(style);
+        \\const probe = document.createElement('div');
+        \\probe.id = 'probe';
+        \\document.body.appendChild(probe);
+    , null);
+    try ctx.processMessage(.{ .id = 1, .method = "Emulation.setDeviceMetricsOverride", .params = .{ .width = 500, .height = 700 } });
+    try testing.expect((try ls.local.exec("probe.getBoundingClientRect().width === 250 && probe.getBoundingClientRect().height === 20", null)).toBool());
+    try ctx.processMessage(.{ .id = 2, .method = "Emulation.setDeviceMetricsOverride", .params = .{ .width = 700, .height = 700 } });
+    try testing.expect((try ls.local.exec("probe.getBoundingClientRect().width === 350 && probe.getBoundingClientRect().height === 40", null)).toBool());
+    try ctx.processMessage(.{ .id = 3, .method = "Emulation.setDeviceMetricsOverride", .params = .{ .width = 300, .height = 700 } });
+    try testing.expect((try ls.local.exec("probe.getBoundingClientRect().width === 150 && probe.getBoundingClientRect().height === 20", null)).toBool());
+}
+
+test "cdp.Emulation: context disposal clears coordinates and page metrics" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-OLD", .url = "hi.html" });
+    const target = bc.firstTarget().?;
+    try ctx.processMessage(.{ .id = 1, .method = "Emulation.setDeviceMetricsOverride", .params = .{ .width = 321, .height = 543 } });
+    try ctx.processMessage(.{ .id = 2, .method = "Emulation.setGeolocationOverride", .params = .{ .latitude = 47.25, .longitude = 19.75 } });
+    try ctx.processMessage(.{ .id = 3, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = "BID-UNKNOWN" } });
+    try testing.expectEqual(321, target.mainPage().?.getViewport().width);
+    try testing.expectEqual(47.25, bc.session.geolocation_override.?.latitude);
+    try ctx.processMessage(.{ .id = 4, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = "BID-OLD" } });
+    try testing.expectEqual(null, ctx.cdp().browser_context);
+
+    const replacement = try ctx.loadBrowserContext(.{ .id = "BID-NEW", .url = "hi.html" });
+    try testing.expectEqual(1920, replacement.firstTarget().?.mainPage().?.getViewport().width);
+    try testing.expectEqual(1080, replacement.firstTarget().?.mainPage().?.getViewport().height);
+    try testing.expectEqual(null, replacement.session.geolocation_override);
 }
 
 test "cdp.Emulation: setGeolocationOverride and clear" {
@@ -580,7 +673,8 @@ test "cdp.Emulation: navigator.geolocation reads the override" {
     });
     try ctx.expectSentResult(null, .{ .id = 2 });
 
-    const frame = bc.mainFrame() orelse unreachable;
+    const target = bc.firstTarget().?;
+    const frame = target.mainFrame() orelse unreachable;
 
     {
         // Registers the callback synchronously; getCurrentPosition schedules
@@ -605,7 +699,7 @@ test "cdp.Emulation: navigator.geolocation reads the override" {
     // for a loaded page, same primitive Runner.waitForSelector/waitForScript
     // use to pump pending scheduler work under a CDP-loaded page.
     var runner = bc.session.runner(.{});
-    _ = try runner.tickForFrame(bc.page_handle.?.frame_id, 1000, .{ .until = .done });
+    _ = try runner.tickForFrame(target.frame_id.?, 1000, .{ .until = .done });
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -643,7 +737,8 @@ test "cdp.Emulation: navigator.geolocation watchPosition delivers the override" 
     });
     try ctx.expectSentResult(null, .{ .id = 2 });
 
-    const frame = bc.mainFrame() orelse unreachable;
+    const target = bc.firstTarget().?;
+    const frame = target.mainFrame() orelse unreachable;
 
     {
         var ls: js.Local.Scope = undefined;
@@ -662,7 +757,7 @@ test "cdp.Emulation: navigator.geolocation watchPosition delivers the override" 
     }
 
     var runner = bc.session.runner(.{});
-    _ = try runner.tickForFrame(bc.page_handle.?.frame_id, 1000, .{ .until = .done });
+    _ = try runner.tickForFrame(target.frame_id.?, 1000, .{ .until = .done });
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -707,7 +802,8 @@ test "cdp.Emulation: navigator.geolocation granted without an override is POSITI
 // Runs getCurrentPosition, pumps the scheduler, and returns the code the error
 // callback saw (0 if the success callback ran instead).
 fn errorCodeFor(bc: *CDP.BrowserContext) !i32 {
-    const frame = bc.mainFrame() orelse unreachable;
+    const target = bc.firstTarget().?;
+    const frame = target.mainFrame() orelse unreachable;
 
     {
         var ls: js.Local.Scope = undefined;
@@ -724,7 +820,7 @@ fn errorCodeFor(bc: *CDP.BrowserContext) !i32 {
     }
 
     var runner = bc.session.runner(.{});
-    _ = try runner.tickForFrame(bc.page_handle.?.frame_id, 1000, .{ .until = .done });
+    _ = try runner.tickForFrame(target.frame_id.?, 1000, .{ .until = .done });
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -754,7 +850,8 @@ test "cdp.Emulation: navigator.geolocation errors PERMISSION_DENIED when permiss
     });
     try ctx.expectSentResult(null, .{ .id = 2 });
 
-    const frame = bc.mainFrame() orelse unreachable;
+    const target = bc.firstTarget().?;
+    const frame = target.mainFrame() orelse unreachable;
 
     {
         // Registers the callback synchronously; getCurrentPosition schedules
@@ -778,7 +875,7 @@ test "cdp.Emulation: navigator.geolocation errors PERMISSION_DENIED when permiss
     // for a loaded page, same primitive Runner.waitForSelector/waitForScript
     // use to pump pending scheduler work under a CDP-loaded page.
     var runner = bc.session.runner(.{});
-    _ = try runner.tickForFrame(bc.page_handle.?.frame_id, 1000, .{ .until = .done });
+    _ = try runner.tickForFrame(target.frame_id.?, 1000, .{ .until = .done });
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);

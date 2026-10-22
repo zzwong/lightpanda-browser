@@ -43,21 +43,22 @@ pub fn processMessage(cmd: *CDP.Command) !void {
 // The Log domain is per session, as in Chrome: entries go to the sessions
 // that enabled it. Without a page target there is nothing to report.
 fn attachedSession(cmd: *CDP.Command) ?*CDP.BrowserContext.AttachedSession {
-    const bc = cmd.browser_context orelse return null;
-    const session_id = cmd.sessionId() orelse bc.session_id orelse return null;
+    const target = cmd.target() catch return null;
+    const bc = target.bc;
+    const session_id = cmd.sessionId() orelse target.session_id orelse return null;
     return bc.attached_sessions.get(session_id);
 }
 
 fn enable(cmd: *CDP.Command) !void {
     if (attachedSession(cmd)) |attached| {
-        try attached.bc.logEnable(attached);
+        try attached.target.bc.logEnable(attached);
     }
     return cmd.sendResult(null, .{});
 }
 
 fn disable(cmd: *CDP.Command) !void {
     if (attachedSession(cmd)) |attached| {
-        attached.bc.logDisable(attached);
+        attached.target.bc.logDisable(attached);
     }
     return cmd.sendResult(null, .{});
 }
@@ -380,7 +381,7 @@ test "cdp.log: entries go to the sessions that enabled the domain" {
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-LOG", .target_id = "FID-0000000LOG".*, .session_id = "SID-LOG" });
-    _ = try bc.attachSession("SID-AUX", null);
+    _ = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
     try ctx.processMessage(.{ .id = 1, .method = "Log.enable", .sessionId = "SID-AUX" });
     try ctx.expectSentResult(null, .{ .id = 1, .session_id = "SID-AUX" });
 
@@ -397,7 +398,7 @@ test "cdp.regression: wrapped Log commands select their auxiliary session" {
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-LOG", .target_id = "FID-0000000LOG".*, .session_id = "SID-LOG" });
-    _ = try bc.attachSession("SID-AUX", null);
+    _ = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
     try ctx.processMessage(.{ .id = 1, .method = "Target.sendMessageToTarget", .params = .{
         .sessionId = "SID-AUX",
         .message = "{\"id\":10,\"method\":\"Log.enable\"}",
