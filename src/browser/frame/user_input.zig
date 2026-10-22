@@ -2150,7 +2150,9 @@ test "user_input: mouse hit testing still enters a blank child document" {
     const y = rect.y + 1;
     const edge_hit = try mouseHitTest(main, rect.x + iframe.asElement().getClientWidth(main), y);
     try testing.expect(edge_hit.frame == main);
-    try testing.expect(edge_hit.target == iframe.asElement());
+    try testing.expect(edge_hit.target != iframe.asElement());
+    const inside_hit = try mouseHitTest(main, rect.x + iframe.asElement().getClientWidth(main) - 1, y);
+    try testing.expect(inside_hit.frame == child);
 
     var ls: js.Local.Scope = undefined;
     child.js.localScope(&ls);
