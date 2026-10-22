@@ -1317,7 +1317,7 @@ test "Session: navigator reads its own network client" {
     try testing.expect((try scope.local.exec("navigator.userAgent === 'SessionBot/1.0' && navigator.language === 'fr-FR'", null)).toBool());
     try testing.expect(!std.mem.eql(u8, browser.http_client.getUserAgent(), "SessionBot/1.0"));
     try testing.expect(client.watchdogHeartbeat() == browser.http_client.watchdogHeartbeat());
-    var runner = session.runner(.{});
-    _ = try runner.tickForFrame(frame._frame_id, 0, .{ .until = .done });
+    var page_runner = session.runner(.{});
+    _ = try page_runner.tickForFrame(frame._frame_id, 0, .{ .until = .done });
     try testing.expect(client.watchdogHeartbeat().last_activity.load(.acquire) > 0);
 }
