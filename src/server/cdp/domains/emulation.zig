@@ -110,7 +110,7 @@ fn setDeviceMetricsOverride(cmd: *CDP.Command) !void {
 
     // The override is stored on the Browser so it persists across page
     // navigations for the whole CDP connection.
-    const browser = &cmd.cdp.browser;
+    const browser = (cmd.browser_context orelse return error.BrowserContextNotLoaded).session;
 
     // CDP convention: a 0 width/height means "don't override that dimension",
     // so keep the current value for any dimension passed as 0.
@@ -189,7 +189,7 @@ fn setGeolocationOverride(cmd: *CDP.Command) !void {
     // back to all-null defaults rather than erroring.
     const params = (try cmd.params(Params)) orelse Params{};
 
-    const browser = &cmd.cdp.browser;
+    const browser = (cmd.browser_context orelse return error.BrowserContextNotLoaded).session;
     if (params.latitude) |lat| {
         if (params.longitude) |lon| {
             browser.geolocation_override = .{
@@ -205,7 +205,7 @@ fn setGeolocationOverride(cmd: *CDP.Command) !void {
 }
 
 fn clearGeolocationOverride(cmd: *CDP.Command) !void {
-    cmd.cdp.browser.geolocation_override = null;
+    (cmd.browser_context orelse return error.BrowserContextNotLoaded).session.geolocation_override = null;
     return cmd.sendResult(null, .{});
 }
 
@@ -533,7 +533,7 @@ test "cdp.Emulation: setGeolocationOverride and clear" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-GEO", .url = "cdp/dom1.html" });
-    const browser = bc.session.browser;
+    const browser = bc.session;
 
     try ctx.processMessage(.{
         .id = 1,
