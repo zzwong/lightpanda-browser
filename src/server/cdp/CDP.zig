@@ -444,11 +444,34 @@ const SendEventOpts = struct {
     session_id: ?[]const u8 = null,
 };
 pub fn sendEvent(self: *CDP, method: []const u8, p: anytype, opts: SendEventOpts) !void {
+    if (opts.session_id) |session_id| {
+        for (self.browser_contexts.items) |bc| {
+            if (bc.attached_sessions.get(session_id)) |attached| {
+                if (!attached.flatten) {
+                    const allocator = self.link.acquireSendArena();
+                    defer self.link.releaseSendArena();
+                    const message = try json.Stringify.valueAlloc(allocator, .{
+                        .method = method,
+                        .params = if (comptime @typeInfo(@TypeOf(p)) == .null) struct {}{} else p,
+                    }, .{ .emit_null_optional_fields = false });
+                    return self.sendWrappedMessage(attached.id, attached.parent_id, message);
+                }
+                break;
+            }
+        }
+    }
     return self.sendJSON(.{
         .method = method,
         .params = if (comptime @typeInfo(@TypeOf(p)) == .null) struct {}{} else p,
         .sessionId = opts.session_id,
     }, .{});
+}
+
+pub fn sendWrappedMessage(self: *CDP, session_id: []const u8, parent_id: ?[]const u8, message: []const u8) anyerror!void {
+    return self.sendEvent("Target.receivedMessageFromTarget", .{
+        .sessionId = session_id,
+        .message = message,
+    }, .{ .session_id = parent_id });
 }
 
 pub const BrowserContext = struct {
@@ -459,6 +482,7 @@ pub const BrowserContext = struct {
     pub const AttachedSession = struct {
         id: []const u8,
         parent_id: ?[]const u8,
+        flatten: bool = true,
         target: *Target,
         inspector_session: js.Inspector.Session,
 
@@ -887,23 +911,44 @@ pub const BrowserContext = struct {
                 i += 1;
                 continue;
             }
-            self.attached_sessions.orderedRemoveAt(i);
-            self.destroySession(attached);
+            _ = self.detachSession(attached.id);
+            i = 0;
         }
         target.session_id = null;
     }
 
     pub fn detachAllSessions(self: *BrowserContext) void {
-        for (self.attached_sessions.values()) |attached| {
-            self.destroySession(attached);
+        while (self.attached_sessions.count() > 0) {
+            const attached = self.attached_sessions.values()[self.attached_sessions.count() - 1];
+            _ = self.detachSession(attached.id);
         }
-        self.attached_sessions.clearRetainingCapacity();
         for (self.targets.items) |target| {
             target.session_id = null;
         }
     }
 
+    fn detachChildSessions(self: *BrowserContext, parent_id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.attached_sessions.count()) {
+            const attached = self.attached_sessions.values()[i];
+            if (attached.parent_id) |id| {
+                if (std.mem.eql(u8, id, parent_id)) {
+                    _ = self.detachSession(attached.id);
+                    i = 0;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
     fn destroySession(self: *BrowserContext, attached: *AttachedSession) void {
+        // Parent routes can cross contexts; retire descendants before their id storage.
+        self.detachChildSessions(attached.id);
+        for (self.cdp.browser_contexts.items) |bc| {
+            if (bc != self) bc.detachChildSessions(attached.id);
+        }
+        attached.target.fetchDisableForSession(attached.id);
         self.notification.unregisterAll(attached);
         attached.inspector_session.deinit();
         self.cdp.allocator.destroy(attached);
@@ -914,6 +959,11 @@ pub const BrowserContext = struct {
     // we should be.
     fn sendInspectorMessage(self: *BrowserContext, msg: []const u8, session_id: []const u8) !void {
         const cdp = self.cdp;
+        if (self.attached_sessions.get(session_id)) |attached| {
+            if (!attached.flatten) {
+                return cdp.sendWrappedMessage(attached.id, attached.parent_id, msg);
+            }
+        }
         const allocator = cdp.link.acquireSendArena();
         defer cdp.link.releaseSendArena();
 
@@ -1101,6 +1151,7 @@ pub const Command = struct {
     const Sender = union(enum) {
         cdp: *CDP,
         capture: *std.Io.Writer,
+        wrapped: struct { cdp: *CDP, session_id: []const u8, parent_id: ?[]const u8 },
 
         pub fn sendJSON(self: Sender, message: anytype, opts: SendJSONOpts) !void {
             switch (self) {
@@ -1109,6 +1160,12 @@ pub const Command = struct {
                     return std.json.Stringify.value(message, .{
                         .emit_null_optional_fields = false,
                     }, writer);
+                },
+                .wrapped => |wrapped| {
+                    const allocator = wrapped.cdp.link.acquireSendArena();
+                    defer wrapped.cdp.link.releaseSendArena();
+                    const raw = try json.Stringify.valueAlloc(allocator, message, .{ .emit_null_optional_fields = false });
+                    return wrapped.cdp.sendWrappedMessage(wrapped.session_id, wrapped.parent_id, raw);
                 },
             }
         }
