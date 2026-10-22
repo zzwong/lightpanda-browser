@@ -569,13 +569,19 @@ pub fn consoleDisable(self: *Target) void {
     self.bc.notification.unregister(.console_message, self);
 }
 
-pub fn runtimeEnable(self: *Target) !void {
+pub fn runtimeEnable(self: *Target, session_id: []const u8) !void {
+    const attached = self.bc.attached_sessions.get(session_id) orelse return error.SessionNotAttached;
     const notification = self.bc.notification;
     try notification.register(.runtime_console_message, self, onRuntimeConsoleMessage);
     try notification.register(.exception_thrown, self, onExceptionThrown);
+    attached.runtime_enabled = true;
 }
 
-pub fn runtimeDisable(self: *Target) void {
+pub fn runtimeDisable(self: *Target, session_id: []const u8) void {
+    if (self.bc.attached_sessions.get(session_id)) |attached| attached.runtime_enabled = false;
+    for (self.bc.attached_sessions.values()) |attached| {
+        if (attached.target == self and attached.runtime_enabled) return;
+    }
     const notification = self.bc.notification;
     notification.unregister(.runtime_console_message, self);
     notification.unregister(.exception_thrown, self);
@@ -773,7 +779,11 @@ fn onRuntimeConsoleMessage(ctx: *anyopaque, msg: *const Notification.ConsoleMess
     if (!self.ownsFrame(msg.frame_id)) return;
     const arena = self.bc.acquireNotificationArena();
     defer self.bc.releaseNotificationArena();
-    return @import("domains/runtime.zig").consoleMessage(arena, self, msg);
+    for (self.bc.attached_sessions.values()) |attached| {
+        if (attached.target == self and attached.runtime_enabled) {
+            try @import("domains/runtime.zig").consoleMessage(arena, self, attached.id, msg);
+        }
+    }
 }
 
 fn onExceptionThrown(ctx: *anyopaque, msg: *const Notification.ExceptionThrown) !void {
@@ -781,7 +791,11 @@ fn onExceptionThrown(ctx: *anyopaque, msg: *const Notification.ExceptionThrown) 
     if (!self.ownsFrame(msg.frame_id)) return;
     const arena = self.bc.acquireNotificationArena();
     defer self.bc.releaseNotificationArena();
-    return @import("domains/runtime.zig").exceptionThrown(arena, self, msg);
+    for (self.bc.attached_sessions.values()) |attached| {
+        if (attached.target == self and attached.runtime_enabled) {
+            try @import("domains/runtime.zig").exceptionThrown(arena, self, attached.id, msg);
+        }
+    }
 }
 
 fn onModelContextToolAdded(ctx: *anyopaque, event: *const Notification.ModelContextToolEvent) !void {
