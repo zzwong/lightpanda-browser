@@ -92,7 +92,7 @@ fn queryAXTree(cmd: *CDP.Command) !void {
     const params: Params = (try cmd.params(Params)) orelse .{};
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const node = try dom.getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try dom.getNode(cmd.arena, bc, cmd.sessionId(), params.nodeId, params.backendNodeId, params.objectId);
 
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
     const temp_arena = try frame.getArena(.medium, "AXNode");
@@ -128,7 +128,7 @@ fn getPartialAXTree(cmd: *CDP.Command) !void {
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const node = try dom.getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try dom.getNode(cmd.arena, bc, cmd.sessionId(), params.nodeId, params.backendNodeId, params.objectId);
 
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
     const temp_arena = try frame.getArena(.medium, "AXNode");

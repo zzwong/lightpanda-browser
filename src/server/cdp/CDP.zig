@@ -163,7 +163,7 @@ pub fn onMessage(self: *CDP, c: *Inbox.Message.Cdp) anyerror!void {
 pub fn processMessage(self: *CDP, msg: []const u8) !void {
     const arena = &self.message_arena;
     defer _ = arena.reset(.{ .retain_with_limit = 1024 * 16 });
-    return self.dispatch(arena.allocator(), .{ .cdp = self }, msg);
+    return self.dispatch(arena.allocator(), .{ .cdp = self }, msg, null);
 }
 
 pub const SendJSONOpts = struct {
@@ -185,21 +185,19 @@ pub fn sendJSON(self: *CDP, message: anytype, opts: SendJSONOpts) !void {
 // The normal Network-thread path doesn't go through here — it parses
 // once on the Network thread and reaches dispatchParsed directly via
 // onMessage.
-pub fn dispatch(self: *CDP, arena: Allocator, sender: Command.Sender, str: []const u8) !void {
-    return self.dispatchForContext(arena, sender, str, null);
-}
-
-pub fn dispatchForContext(self: *CDP, arena: Allocator, sender: Command.Sender, str: []const u8, context: ?*BrowserContext) !void {
+// A wrapped command has no sessionId of its own; retain the addressed
+// attachment for routing while replies keep their original envelope.
+pub fn dispatch(self: *CDP, arena: Allocator, sender: Command.Sender, str: []const u8, target_session_id: ?[]const u8) !void {
     const input = json.parseFromSliceLeaky(InputMessage, arena, str, .{
         .ignore_unknown_fields = true,
     }) catch return error.InvalidJSON;
-    return self.dispatchParsed(arena, sender, str, input, context);
+    return self.dispatchParsed(arena, sender, str, input, target_session_id);
 }
 
 // Dispatch a pre-parsed CDP message. The caller is responsible for
 // keeping `str` and the backing storage for `input`'s string slices
 // alive for the duration of the call.
-fn dispatchParsed(self: *CDP, arena: Allocator, sender: Command.Sender, str: []const u8, input: InputMessage, context: ?*BrowserContext) !void {
+fn dispatchParsed(self: *CDP, arena: Allocator, sender: Command.Sender, str: []const u8, input: InputMessage, target_session_id: ?[]const u8) !void {
     lp.metrics.serve_commands.incr(.cdp);
 
     var command = Command{
@@ -213,10 +211,11 @@ fn dispatchParsed(self: *CDP, arena: Allocator, sender: Command.Sender, str: []c
         .cdp = self,
         .arena = arena,
         .sender = sender,
-        .browser_context = context orelse self.browser_context,
+        .browser_context = self.browser_context,
+        .target_session_id = target_session_id,
     };
 
-    if (command.input.session_id) |sid| {
+    if (command.sessionId()) |sid| {
         for (self.browser_contexts.items) |bc| {
             if (bc.attached_sessions.contains(sid)) {
                 command.browser_context = bc;
@@ -1417,7 +1416,7 @@ pub const BrowserContext = struct {
 
     /// Forwards `cmd`'s raw JSON to the inspector session of the session it was sent through.
     pub fn callInspector(self: *BrowserContext, cmd: *const Command) !void {
-        const inspector_session = try self.inspectorSession(cmd.input.session_id);
+        const inspector_session = try self.inspectorSession(cmd.sessionId());
         inspector_session.send(cmd.input.json);
         self.session.browser.env.runMicrotasks();
     }
@@ -1606,6 +1605,8 @@ pub const Command = struct {
     // The browser context this command targets
     browser_context: ?*BrowserContext,
 
+    target_session_id: ?[]const u8 = null,
+
     // The command input (the id, optional session_id, params, ...)
     input: Input,
 
@@ -1641,6 +1642,10 @@ pub const Command = struct {
             );
         }
         return null;
+    }
+
+    pub fn sessionId(self: *const Command) ?[]const u8 {
+        return self.input.session_id orelse self.target_session_id;
     }
 
     pub fn httpClient(self: *const Command) *HttpClient {

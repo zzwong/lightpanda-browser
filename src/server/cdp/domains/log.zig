@@ -44,7 +44,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
 // that enabled it. Without a page target there is nothing to report.
 fn attachedSession(cmd: *CDP.Command) ?*CDP.BrowserContext.AttachedSession {
     const bc = cmd.browser_context orelse return null;
-    const session_id = cmd.input.session_id orelse bc.session_id orelse return null;
+    const session_id = cmd.sessionId() orelse bc.session_id orelse return null;
     return bc.attached_sessions.get(session_id);
 }
 
