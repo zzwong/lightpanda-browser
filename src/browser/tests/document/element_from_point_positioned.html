@@ -46,6 +46,14 @@ testing.expectEqual(100, child.getBoundingClientRect().width);
 child.style.cssText = 'position:absolute;left:10px;right:20px;max-width:100px;min-width:120px;height:20px';
 testing.expectEqual(120, child.getBoundingClientRect().width);
 </script>
+<script id="inset_stretching_preserves_intrinsic_width_attributes">
+const image = document.createElement('img');
+image.setAttribute('width', '40');
+image.style.cssText = 'position:absolute;left:10px;right:20px;height:20px';
+parent.appendChild(image);
+testing.expectEqual(40, image.getBoundingClientRect().width);
+image.remove();
+</script>
 <script id="negative_and_percentage_insets">
 child.style.cssText = 'position:absolute;left:-20px;top:-10px;width:40px;height:20px';
 c = child.getBoundingClientRect();
