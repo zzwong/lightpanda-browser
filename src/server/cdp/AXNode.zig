@@ -319,6 +319,74 @@ pub const Writer = struct {
         value: AXValue,
     };
 
+    pub const AriaState = enum { true, false, mixed };
+
+    /// Like Chrome, any other token, even " false ", reads as true.
+    fn parseAriaState(value: []const u8) AriaState {
+        if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "false")) return .false;
+        if (std.ascii.eqlIgnoreCase(value, "mixed")) return .mixed;
+        return .true;
+    }
+
+    const RoleStates = struct {
+        expanded: bool = false,
+        // Only tri-state roles keep aria-checked="mixed"; the rest read it as false.
+        checked: ?enum { binary, tri_state } = null,
+        // Options and tree items are only checkable once aria-checked is set.
+        checked_needs_attr: bool = false,
+    };
+
+    fn roleStates(role: []const u8) RoleStates {
+        const max_len = "menuitemcheckbox".len;
+        if (role.len > max_len) return .{};
+        var buf: [max_len]u8 = undefined;
+        const roles = std.StaticStringMap(RoleStates).initComptime(.{
+            .{ "application", RoleStates{ .expanded = true } },
+            .{ "button", RoleStates{ .expanded = true } },
+            .{ "checkbox", RoleStates{ .expanded = true, .checked = .tri_state } },
+            .{ "columnheader", RoleStates{ .expanded = true } },
+            .{ "combobox", RoleStates{ .expanded = true } },
+            .{ "gridcell", RoleStates{ .expanded = true } },
+            .{ "link", RoleStates{ .expanded = true } },
+            .{ "listbox", RoleStates{ .expanded = true } },
+            .{ "listitem", RoleStates{ .expanded = true } },
+            .{ "menuitem", RoleStates{ .expanded = true } },
+            .{ "menuitemcheckbox", RoleStates{ .expanded = true, .checked = .tri_state } },
+            .{ "menuitemradio", RoleStates{ .expanded = true, .checked = .binary } },
+            .{ "option", RoleStates{ .checked = .tri_state, .checked_needs_attr = true } },
+            .{ "radio", RoleStates{ .checked = .binary } },
+            .{ "row", RoleStates{ .expanded = true } },
+            .{ "rowheader", RoleStates{ .expanded = true } },
+            .{ "switch", RoleStates{ .expanded = true, .checked = .binary } },
+            .{ "tab", RoleStates{ .expanded = true } },
+            .{ "treeitem", RoleStates{ .expanded = true, .checked = .tri_state, .checked_needs_attr = true } },
+        });
+        return roles.get(std.ascii.lowerString(&buf, role)) orelse .{};
+    }
+
+    // Native input checked state remains owned by the input serializer.
+    pub const AriaProperties = struct {
+        expanded: ?bool = null,
+        checked: ?AriaState = null,
+    };
+
+    pub fn ariaProperties(el: *DOMNode.Element, role: []const u8) AriaProperties {
+        const states = roleStates(role);
+        var props: AriaProperties = .{};
+        if (states.expanded and el.getTag() != .select) {
+            const raw = el.getAttributeInterned("aria-expanded") orelse "";
+            if (raw.len != 0) props.expanded = parseAriaState(raw) != .false;
+        }
+        if (states.checked) |kind| {
+            const raw = el.getAttributeSafe(.wrap("aria-checked")) orelse "";
+            if (el.getTag() != .input and (raw.len != 0 or !states.checked_needs_attr)) {
+                const state = parseAriaState(raw);
+                props.checked = if (state == .mixed and kind == .binary) .false else state;
+            }
+        }
+        return props;
+    }
+
     fn writeAXProperties(self: *const Writer, axnode: AXNode, w: anytype) !void {
         const frame = self.frame;
         const dom_node = axnode.dom;
@@ -344,15 +412,16 @@ pub const Writer = struct {
                     .img => {
                         const img = el.as(DOMNode.Element.Html.Image);
                         const uri = try img.getSrc(self.frame);
-                        if (uri.len == 0) return;
-                        try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
+                        if (uri.len != 0) {
+                            try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
+                        }
                     },
                     .a => {
                         const a = el.as(DOMNode.Element.Html.Anchor);
                         const uri = try a.getHref(self.frame);
-                        if (uri.len == 0) return;
-                        try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
-                        try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
+                        if (uri.len != 0) {
+                            try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
+                        }
                     },
                     .input => {
                         const input = el.as(DOMNode.Element.Html.Input);
@@ -396,8 +465,7 @@ pub const Writer = struct {
                                 try self.writeAXProperty(.{ .name = .required, .value = .{ .boolean = el.hasAttributeInterned("required") } }, w);
                             },
                             .checkbox, .radio => {
-                                const is_checked = el.hasAttributeInterned("checked");
-                                try self.writeAXProperty(.{ .name = .checked, .value = .{ .token = if (is_checked) "true" else "false" } }, w);
+                                try self.writeAXProperty(.{ .name = .checked, .value = .{ .token = if (input._checked) "true" else "false" } }, w);
                             },
                             .range, .color, .date, .time, .@"datetime-local", .month, .week => {
                                 if (!is_disabled) {
@@ -481,6 +549,23 @@ pub const Writer = struct {
                         try self.writeAXProperty(.{ .name = .level, .value = .{ .integer = @max(level, 1) } }, w);
                     },
                     else => {},
+                }
+
+                // Resolved roles gate states. Native select/input states are handled above.
+                const aria = ariaProperties(el, try axnode.getRole());
+                if (aria.expanded) |expanded| {
+                    try self.writeAXProperty(.{ .name = .expanded, .value = .{ .booleanOrUndefined = expanded } }, w);
+                }
+                if (aria.checked) |checked| {
+                    try self.writeAXProperty(.{ .name = .checked, .value = .{ .token = @tagName(checked) } }, w);
+                }
+
+                // Hidden and inert nodes never reach here, so tabindex alone decides.
+                switch (el.getTag()) {
+                    .input, .textarea, .select, .button, .option => {},
+                    else => if (el.focusTabIndex() != null) {
+                        try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
+                    },
                 }
             },
             else => |tag| {
@@ -993,7 +1078,7 @@ fn writeName(
                     const trimmed_id = std.mem.trim(u8, id, &std.ascii.whitespace);
                     if (trimmed_id.len == 0) continue;
 
-                    if (doc.getElementById(trimmed_id, frame)) |referenced_el| {
+                    if (doc.getElementById(trimmed_id)) |referenced_el| {
                         // Get the text content of the referenced element
                         try referenced_el.getInnerText(&buf.writer, frame);
                         try buf.writer.writeByte(' ');
@@ -1244,7 +1329,7 @@ fn labelPromotionTarget(
     if (el.getTag() != .label) return null;
 
     const label = el.as(DOMNode.Element.Html.Label);
-    const control = label.getControl(frame) orelse return null;
+    const control = label.getControl() orelse return null;
     if (control.getTag() != .input) return null;
     const input = control.as(DOMNode.Element.Html.Input);
     switch (input._input_type) {
@@ -1624,20 +1709,18 @@ test "AXNode: writer" {
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
         .label_index = &label_index,
         .temp_arena = temp_arena,
     }, .{});
-    defer testing.allocator.free(json);
 
     // Check that the document node is present with proper structure
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
 
-    const nodes = parsed.value.array.items;
+    const nodes = parsed.array.items;
     try testing.expect(nodes.len > 0);
 
     // First node should be the document
@@ -1699,18 +1782,16 @@ test "AXNode: writer prunes hidden and resolves labels" {
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
         .label_index = &label_index,
         .temp_arena = temp_arena,
     }, .{});
-    defer testing.allocator.free(json);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
-    const nodes = parsed.value.array.items;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
+    const nodes = parsed.array.items;
 
     // No hidden-subtree text should have leaked into the tree.
     const hidden_texts = [_][]const u8{
@@ -1782,7 +1863,7 @@ test "AXNode: Writer query filters by role" {
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
 
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
@@ -1790,12 +1871,10 @@ test "AXNode: Writer query filters by role" {
         .temp_arena = temp_arena,
         .filter = .{ .role = "heading" },
     }, .{});
-    defer testing.allocator.free(json);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
 
-    const nodes = parsed.value.array.items;
+    const nodes = parsed.array.items;
     // Fixture has one <h1>Visible</h1>.
     try testing.expectEqual(1, nodes.len);
 
@@ -1862,22 +1941,72 @@ test "AXNode: writer maps password input to textbox" {
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
         .label_index = &label_index,
         .temp_arena = temp_arena,
     }, .{});
-    defer testing.allocator.free(json);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
 
-    const textbox = findNode(parsed.value.array.items, "textbox", "Password") orelse return error.PasswordTextboxNodeNotFound;
+    const textbox = findNode(parsed.array.items, "textbox", "Password") orelse return error.PasswordTextboxNodeNotFound;
     try testing.expectEqual(false, textbox.get("ignored").?.bool);
     const required = nodeProperty(textbox, "required") orelse return error.PasswordRequiredPropertyNotFound;
     try testing.expectEqual(true, required.get("value").?.bool);
+}
+
+test "AXNode: writer reports the current checked state, not the attribute" {
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var page = try testing.pageTest("cdp/ax_tree.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var doc = frame.window._document;
+
+    const body = (try doc.querySelector(comptime .wrap("body"), frame)).?;
+
+    const Case = struct { label: []const u8, type: []const u8, attribute: bool, checked: bool };
+    const cases = [_]Case{
+        .{ .label = "Unticked box", .type = "checkbox", .attribute = true, .checked = false },
+        .{ .label = "Ticked box", .type = "checkbox", .attribute = false, .checked = true },
+        .{ .label = "Picked radio", .type = "radio", .attribute = false, .checked = true },
+    };
+    for (cases) |case| {
+        const label = try doc.createElement("label", null, frame);
+        const input = try doc.createElement("input", null, frame);
+        try input.setAttributeSafe(comptime .wrap("type"), .wrap(case.type), frame);
+        if (case.attribute) {
+            try input.setAttributeSafe(comptime .wrap("checked"), comptime .wrap(""), frame);
+        }
+        try input.as(DOMNode.Element.Html.Input).setChecked(case.checked, frame);
+        _ = try label.asNode().appendChild(input.asNode(), frame);
+        _ = try label.asNode().appendChild(try doc.createTextNode(case.label), frame);
+        _ = try body.asNode().appendChild(label.asNode(), frame);
+    }
+
+    const node = try registry.register(doc.asNode());
+    var label_index: Label.LabelByForIndex = .{};
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer temp_arena.release();
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
+        .root = node,
+        .registry = &registry,
+        .frame = frame,
+        .label_index = &label_index,
+        .temp_arena = temp_arena,
+    }, .{});
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
+
+    for (cases) |case| {
+        const ax = findNode(parsed.array.items, case.type, case.label) orelse return error.InputNotFound;
+        const checked = nodeProperty(ax, "checked") orelse return error.CheckedPropertyNotFound;
+        try testing.expectEqual(if (case.checked) "true" else "false", checked.get("value").?.string);
+    }
 }
 
 test "AXNode: Writer query filters by accessible name" {
@@ -1895,7 +2024,7 @@ test "AXNode: Writer query filters by accessible name" {
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
 
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
@@ -1903,12 +2032,10 @@ test "AXNode: Writer query filters by accessible name" {
         .temp_arena = temp_arena,
         .filter = .{ .accessible_name = "Search" },
     }, .{});
-    defer testing.allocator.free(json);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
 
-    const nodes = parsed.value.array.items;
+    const nodes = parsed.array.items;
     // Fixture has <label for="search-input">Search</label> — its accessible
     // name is "Search". The label itself plus the input it labels both
     // surface as candidates; verify at least one match with the right name.
@@ -1939,25 +2066,22 @@ test "AXNode: Writer query and subtree root see a hiding ancestor" {
         .temp_arena = temp_arena,
         .filter = .{ .accessible_name = "under-inert" },
     };
-    const query = try std.json.Stringify.valueAlloc(testing.allocator, writer, .{});
-    defer testing.allocator.free(query);
+    const query = try std.json.Stringify.valueAlloc(testing.arena_allocator, writer, .{});
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, query, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, query, .{});
     // Chrome returns no match (an ignored node has no name); we may, but ignored
-    for (parsed.value.array.items) |n| {
+    for (parsed.array.items) |n| {
         try testing.expectEqual(true, n.object.get("ignored").?.bool);
     }
 
     const button = (try frame.window._document.querySelector(.wrap("#under-inert"), frame)).?;
     const host = (try frame.window._document.querySelector(.wrap("#inert-host"), frame)).?;
-    const shadow_button = host.getShadowRoot(frame).?.getElementById("in-inert-shadow", frame).?;
+    const shadow_button = host.getShadowRoot(frame).?.getElementById("in-inert-shadow").?;
 
     writer.filter = null;
     for ([_]*DOMNode.Element{ button, shadow_button }) |root| {
         writer.root = try registry.register(root.asNode());
-        const tree = try std.json.Stringify.valueAlloc(testing.allocator, writer, .{});
-        defer testing.allocator.free(tree);
+        const tree = try std.json.Stringify.valueAlloc(testing.arena_allocator, writer, .{});
 
         try testing.expect(std.mem.find(u8, tree, "\"ignored\":true") != null);
         try testing.expect(std.mem.find(u8, tree, "\"childIds\":[]") != null);
@@ -1985,7 +2109,7 @@ test "AXNode: Writer query combined role+name filter promotes hidden-input label
     //   - the hidden input (intrinsic role="checkbox", ignored=true)
     // The label is the actionable target — a real client searching by role
     // would act on the entry with ignored=false.
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
@@ -1993,12 +2117,10 @@ test "AXNode: Writer query combined role+name filter promotes hidden-input label
         .temp_arena = temp_arena,
         .filter = .{ .accessible_name = "Enable feature", .role = "checkbox" },
     }, .{});
-    defer testing.allocator.free(json);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
 
-    const nodes = parsed.value.array.items;
+    const nodes = parsed.array.items;
     try testing.expect(nodes.len >= 1);
 
     // Every match has the right role and name.
@@ -2030,7 +2152,7 @@ test "AXNode: Writer query no match returns empty array" {
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
 
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
@@ -2038,12 +2160,10 @@ test "AXNode: Writer query no match returns empty array" {
         .temp_arena = temp_arena,
         .filter = .{ .role = "marquee" },
     }, .{});
-    defer testing.allocator.free(json);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
 
-    try testing.expectEqual(0, parsed.value.array.items.len);
+    try testing.expectEqual(0, parsed.array.items.len);
 }
 
 test "AXNode: nameFromContentRole" {
@@ -2106,14 +2226,13 @@ test "AXNode: writer prunes children when root is hidden" {
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
 
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
         .root = node,
         .registry = &registry,
         .frame = frame,
         .label_index = &label_index,
         .temp_arena = temp_arena,
     }, .{});
-    defer testing.allocator.free(json);
 
     try testing.expect(std.mem.find(u8, json, "under-display-none") == null);
     try testing.expect(std.mem.find(u8, json, "\"childIds\":[]") != null);
@@ -2134,7 +2253,7 @@ test "AXNode: writer depth cuts every branch at the same level" {
 
     // document(0) > html(1) > body(2) > div, ul, button(3) > p, li, text(4) > text(5)
     {
-        const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+        const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
             .root = node,
             .registry = &registry,
             .frame = frame,
@@ -2142,11 +2261,9 @@ test "AXNode: writer depth cuts every branch at the same level" {
             .temp_arena = temp_arena,
             .depth = 3,
         }, .{});
-        defer testing.allocator.free(json);
 
-        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-        defer parsed.deinit();
-        const nodes = parsed.value.array.items;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
+        const nodes = parsed.array.items;
 
         // Every branch reaches depth 3, not only the first one.
         try testing.expect(findNode(nodes, "list", "") != null);
@@ -2158,7 +2275,7 @@ test "AXNode: writer depth cuts every branch at the same level" {
     }
 
     {
-        const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+        const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
             .root = node,
             .registry = &registry,
             .frame = frame,
@@ -2166,11 +2283,9 @@ test "AXNode: writer depth cuts every branch at the same level" {
             .temp_arena = temp_arena,
             .depth = 4,
         }, .{});
-        defer testing.allocator.free(json);
 
-        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
-        defer parsed.deinit();
-        const nodes = parsed.value.array.items;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, json, .{});
+        const nodes = parsed.array.items;
 
         try testing.expect(findNode(nodes, "paragraph", "") != null);
         try testing.expect(findNode(nodes, "listitem", "") != null);
@@ -2234,6 +2349,32 @@ test "AXNode: aria-hidden is case-insensitive" {
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
 
+    const json = try std.json.Stringify.valueAlloc(testing.arena_allocator, Writer{
+        .root = node,
+        .registry = &registry,
+        .frame = frame,
+        .label_index = &label_index,
+        .temp_arena = temp_arena,
+    }, .{});
+
+    try testing.expect(std.mem.find(u8, json, "hidden-upper") == null);
+    try testing.expect(std.mem.find(u8, json, "hidden-mixed") == null);
+    try testing.expect(std.mem.find(u8, json, "visible-false") != null);
+}
+
+test "AXNode: custom ARIA states and tabindex focusability" {
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var page = try testing.pageTest("cdp/ax_aria_states.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var label_index: Label.LabelByForIndex = .{};
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer temp_arena.release();
+
+    const node = try registry.register(frame.window._document.asNode());
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
         .registry = &registry,
@@ -2243,7 +2384,86 @@ test "AXNode: aria-hidden is case-insensitive" {
     }, .{});
     defer testing.allocator.free(json);
 
-    try testing.expect(std.mem.find(u8, json, "hidden-upper") == null);
-    try testing.expect(std.mem.find(u8, json, "hidden-mixed") == null);
-    try testing.expect(std.mem.find(u8, json, "visible-false") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.array.items;
+
+    const Case = struct { role: ?[]const u8, name: []const u8, property: []const u8, value: ?std.json.Value };
+    const cases = [_]Case{
+        .{ .role = "button", .name = "Expanded details", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Collapsed details", .property = "expanded", .value = .{ .bool = false } },
+        .{ .role = "button", .name = "Invalid details", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Spaced expanded", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Empty expanded", .property = "expanded", .value = null },
+        .{ .role = "listitem", .name = "Listitem expanded", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Uppercase expanded", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Uppercase collapsed", .property = "expanded", .value = .{ .bool = false } },
+        .{ .role = null, .name = "Generic expanded", .property = "expanded", .value = null },
+        .{ .role = "button", .name = "Custom anchor", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Custom image", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "switch", .name = "Expanded switch", .property = "expanded", .value = .{ .bool = true } },
+
+        .{ .role = "checkbox", .name = "Mixed terms", .property = "checked", .value = .{ .string = "mixed" } },
+        .{ .role = "checkbox", .name = "Checked terms", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "checkbox", .name = "Unfocusable terms", .property = "checked", .value = .{ .string = "false" } },
+        .{ .role = "checkbox", .name = "Invalid state", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "checkbox", .name = "Empty checked", .property = "checked", .value = .{ .string = "false" } },
+        .{ .role = "checkbox", .name = "Spaced checked", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "option", .name = "Option checked", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "option", .name = "Option mixed", .property = "checked", .value = .{ .string = "mixed" } },
+        .{ .role = "treeitem", .name = "Treeitem checked", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "treeitem", .name = "Treeitem checked", .property = "expanded", .value = .{ .bool = false } },
+        .{ .role = "option", .name = "Option absent", .property = "checked", .value = null },
+        .{ .role = "option", .name = "Native option", .property = "checked", .value = null },
+        .{ .role = "treeitem", .name = "Treeitem absent", .property = "checked", .value = null },
+        .{ .role = "checkbox", .name = "Padded false", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "checkbox", .name = "Blank checked", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "button", .name = "Padded collapsed", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "button", .name = "Blank expanded", .property = "expanded", .value = .{ .bool = true } },
+        .{ .role = "checkbox", .name = "Uppercase mixed", .property = "checked", .value = .{ .string = "mixed" } },
+        .{ .role = "checkbox", .name = "Absent checked", .property = "checked", .value = .{ .string = "false" } },
+        .{ .role = "checkbox", .name = "Native terms", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "switch", .name = "Switch checked", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "switch", .name = "Switch mixed", .property = "checked", .value = .{ .string = "false" } },
+        .{ .role = "menuitemcheckbox", .name = "Menu checkbox checked", .property = "checked", .value = .{ .string = "true" } },
+        .{ .role = "menuitemcheckbox", .name = "Menu checkbox mixed", .property = "checked", .value = .{ .string = "mixed" } },
+        .{ .role = "radio", .name = "Radio unchecked", .property = "checked", .value = .{ .string = "false" } },
+        .{ .role = "radio", .name = "Radio absent", .property = "checked", .value = .{ .string = "false" } },
+        .{ .role = "menuitemradio", .name = "Menu radio checked", .property = "checked", .value = .{ .string = "true" } },
+
+        .{ .role = "checkbox", .name = "Mixed terms", .property = "focusable", .value = .{ .bool = true } },
+        // A negative tabindex is focusable through script, but not Tab navigation.
+        .{ .role = "checkbox", .name = "Checked terms", .property = "focusable", .value = .{ .bool = true } },
+        .{ .role = "checkbox", .name = "Unfocusable terms", .property = "focusable", .value = null },
+        .{ .role = "checkbox", .name = "Invalid state", .property = "focusable", .value = null },
+        .{ .role = "button", .name = "Custom anchor", .property = "focusable", .value = .{ .bool = true } },
+        .{ .role = "link", .name = "Plain link", .property = "focusable", .value = .{ .bool = true } },
+    };
+    for (cases) |case| {
+        const ax_node = findNode(nodes, case.role, case.name) orelse return error.NodeNotFound;
+        const actual = if (nodeProperty(ax_node, case.property)) |property| property.get("value").? else null;
+        const expected = case.value orelse {
+            try testing.expect(actual == null);
+            continue;
+        };
+        const value = actual orelse return error.PropertyNotFound;
+        switch (expected) {
+            .bool => |b| try testing.expectEqual(b, value.bool),
+            .string => |s| try testing.expectEqual(s, value.string),
+            else => unreachable,
+        }
+    }
+
+    // Native input serialization already includes checked; do not emit it twice.
+    const native = findNode(nodes, "checkbox", "Native terms") orelse return error.NativeCheckboxNotFound;
+    var checked_count: usize = 0;
+    for (native.get("properties").?.array.items) |property| {
+        if (std.mem.eql(u8, property.object.get("name").?.string, "checked")) {
+            checked_count += 1;
+        }
+    }
+    try testing.expectEqual(1, checked_count);
+
+    try testing.expect(findNode(nodes, "checkbox", "Inert terms") == null);
+    try testing.expect(findNode(nodes, "checkbox", "Hidden terms") == null);
 }

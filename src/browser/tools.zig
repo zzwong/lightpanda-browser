@@ -1270,6 +1270,14 @@ fn weaknessNote(arena: std.mem.Allocator, frame: *const lp.Frame) !?[]const u8 {
     if (iframes > 0) {
         try notes.append(arena, try arena.print("{d} iframe(s) were not loaded: subframe loading is off.", .{iframes}));
     }
+    if (status.resource_challenge) |challenge| {
+        try notes.append(arena, try arena.print("A {s} bot challenge blocked some of the page's own requests: content they load is missing.", .{@tagName(challenge)}));
+    } else {
+        const blocked = status.blocked.total();
+        if (blocked > 0) {
+            try notes.append(arena, try arena.print("{d} of the page's own request(s) were refused with HTTP 403/429, likely bot detection or rate limiting: content they load is missing.", .{blocked}));
+        }
+    }
     if (notes.items.len == 0) {
         return null;
     }
@@ -2688,6 +2696,7 @@ pub const StartedGoto = struct {
 /// right after createPage but navigate can change/null it, so callers re-fetch.
 fn openPage(session: *lp.Session, url: [:0]const u8) ToolError!lp.Session.PageHandle {
     const page = session.createPage() catch return ToolError.NavigationFailed;
+    errdefer page.close();
     _ = page.frame().?.navigate(url, .{
         .reason = .address_bar,
         .kind = .{ .push = null },
@@ -3052,6 +3061,61 @@ test "goto: a navigation stuck waiting for a connection is an error" {
     , .{});
     const r = try call(aa, session, &registry, "goto", args, .{ .source = .user });
     try std.testing.expectEqualStrings("Navigated. HTTP 200 OK.", r.text);
+}
+
+test "tools: tree exposes Chrome-matched custom ARIA states" {
+    var registry: NodeRegistry = .init(std.testing.allocator);
+    defer registry.deinit();
+
+    var page = try testing.pageTest("cdp/ax_aria_states.html", .{});
+    defer page.close();
+
+    const result = try call(testing.arena_allocator, page.session, &registry, "tree", null, .{ .source = .user });
+    const expected = [_][]const u8{
+        "button 'Expanded details' [expanded]",
+        "button 'Collapsed details' [collapsed]",
+        "button 'Uppercase expanded' [expanded]",
+        "button 'Invalid details' [expanded]",
+        "button 'Spaced expanded' [expanded]",
+        "listitem 'Listitem expanded' [expanded]",
+        "checkbox 'Invalid state' [checked]",
+        "checkbox 'Empty checked' [unchecked]",
+        "checkbox 'Spaced checked' [checked]",
+        "option 'Option checked' [checked]",
+        "option 'Option mixed' [mixed]",
+        "treeitem 'Treeitem checked' [collapsed] [checked]",
+        "checkbox 'Padded false' [checked]",
+        "button 'Padded collapsed' [expanded]",
+        "checkbox 'Uppercase mixed' [mixed]",
+        "checkbox 'Absent checked' [unchecked]",
+        "switch 'Switch mixed' [unchecked]",
+        "menuitemcheckbox 'Menu checkbox mixed' [mixed]",
+        "button 'Custom anchor' [expanded]",
+        "checkbox 'Checked terms' [checked]",
+    };
+    for (expected) |fragment| {
+        if (std.mem.find(u8, result.text, fragment) == null) {
+            std.debug.print("missing {s} in:\n{s}\n", .{ fragment, result.text });
+            return error.MissingExpectedAriaState;
+        }
+    }
+
+    // Unsupported roles, empty expanded values, and options or tree items
+    // without aria-checked must not manufacture state.
+    const ignored = [_][]const u8{ "'Generic expanded'", "'Empty expanded'", "'Option absent'", "'Treeitem absent'" };
+    for (ignored) |name| {
+        var lines = std.mem.splitScalar(u8, result.text, '\n');
+        var found = false;
+        while (lines.next()) |line| {
+            if (std.mem.find(u8, line, name) == null) continue;
+            found = true;
+            if (std.mem.find(u8, line, " [expanded]") != null) return error.UnexpectedExpanded;
+            if (std.mem.find(u8, line, " [checked]") != null) return error.UnexpectedChecked;
+            if (std.mem.find(u8, line, " [unchecked]") != null) return error.UnexpectedUnchecked;
+        }
+        if (!found) return error.IgnoredNodeMissing;
+    }
+    try std.testing.expect(std.mem.find(u8, result.text, "'Hidden terms'") == null);
 }
 
 test "tools: goto flags an error status instead of reporting success" {
@@ -3591,6 +3655,21 @@ test "markdown: alternate reads the page's text/markdown link" {
     , .{}), .{ .source = .user });
     try std.testing.expect(std.mem.find(u8, failed.text, "Rendered page") != null);
     try std.testing.expect(std.mem.find(u8, failed.text, "markdown alternate") == null);
+}
+
+test "startGoto: a navigation that fails to start leaves no page behind" {
+    var registry: NodeRegistry = .init(std.testing.allocator);
+    defer registry.deinit();
+
+    const session = testing.test_session;
+    const pages = session.pages.items.len;
+
+    const aa = testing.arena_allocator;
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, aa,
+        \\{"url":"blob:http://localhost:9582/missing"}
+    , .{});
+    try std.testing.expectError(ToolError.NavigationFailed, startGoto(aa, session, &registry, args, null));
+    try std.testing.expectEqual(pages, session.pages.items.len);
 }
 
 test "markdown: a same-url page whose navigation failed is navigated again" {
