@@ -969,14 +969,8 @@ fn hitTestImpl(self: *Document, viewport_x: f64, viewport_y: f64, ignore_x: bool
     // Flat-tree order supplies the tiebreak; stacking contexts determine
     // which intersecting box is on top. Geometry remains the faux layout.
     //
-    // Faux-layout shortcut: rect.top is calculateDocumentPosition × 5, which is
-    // monotonically increasing in document order. So we maintain a running
-    // preorder counter instead of calling calculateDocumentPosition per node
-    // (which itself is O(N)). Once the counter's y passes the query y, no
-    // later element can contain the point, and we can return.
-    //
-    // Hidden subtrees still count towards the index so positions agree with
-    // getBoundingClientRect; the hidden verdict just rides down the stack.
+    // Normal-flow boxes retain preorder geometry. Positioned boxes can cover
+    // an earlier point, so a hit must consider later nodes too.
     var topmost: ?*Element = null;
     var topmost_order: ?*const HitTestOrder = null;
 
@@ -1009,11 +1003,6 @@ fn hitTestImpl(self: *Document, viewport_x: f64, viewport_y: f64, ignore_x: bool
         var paint_parent = entry.paint_parent;
         const pos = preorder_index * 5.0;
 
-        if (pos > y) {
-            // Monotonic: no later element has top <= y, so none can contain (x, y).
-            return topmost;
-        }
-
         preorder_index += 1;
         if (node.is(Element)) |element| {
             hidden = hidden or style_manager.hasDisplayNone(element);
@@ -1030,11 +1019,13 @@ fn hitTestImpl(self: *Document, viewport_x: f64, viewport_y: f64, ignore_x: bool
             // Unlike display:none, a child can opt back in, so the subtree is
             // still walked.
             if (!hidden and style_manager.isHitTestable(element)) {
-                if (y >= pos and y <= pos + element.boxAxis(frame, .height)) {
-                    // Only calculate horizontal position for candidates in
-                    // the vertical band, preserving the layout shortcut.
-                    const left = if (ignore_x) 0 else element.horizontalPosition(frame);
-                    if (ignore_x or (x >= left and x <= left + element.boxAxis(frame, .width))) {
+                const positioned = element.positionedClientRect(frame);
+                const top = if (positioned) |rect| rect.y + @as(f64, @floatFromInt(owner.window.getScrollY())) else pos;
+                const height = if (positioned) |rect| rect.height else element.boxAxis(frame, .height);
+                if (y >= top and y <= top + height) {
+                    const left = if (ignore_x) 0 else if (positioned) |rect| rect.x + @as(f64, @floatFromInt(owner.window.getScrollX())) else element.horizontalPosition(frame);
+                    const width = if (positioned) |rect| rect.width else element.boxAxis(frame, .width);
+                    if (ignore_x or (x >= left and x <= left + width)) {
                         const key = if (owns_order) paint_parent.? else blk: {
                             const key = try frame.local_arena.create(HitTestOrder);
                             key.* = .box(paint_parent, false, order);

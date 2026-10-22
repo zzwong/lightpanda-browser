@@ -18,12 +18,52 @@
 
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
+const units = @import("units.zig");
 
 pub const Declaration = struct {
     name: []const u8,
     value: []const u8,
     important: bool,
 };
+
+pub const inset_sides = [_][]const u8{ "top", "right", "bottom", "left" };
+pub const InsetUnit = enum(u3) { auto, px, percentage, vw, vh };
+pub const InsetValue = struct { value: f32 = 0, unit: InsetUnit = .auto };
+
+pub fn parseInset(text: []const u8) ?InsetValue {
+    if (std.ascii.eqlIgnoreCase(text, "auto") or std.ascii.eqlIgnoreCase(text, "initial") or std.ascii.eqlIgnoreCase(text, "unset")) return .{};
+    const parsed = units.parse(text) catch return null;
+    if (@abs(parsed.value) > std.math.floatMax(f32)) return null;
+    return switch (parsed.unit) {
+        .percentage => .{ .value = @floatCast(parsed.value), .unit = .percentage },
+        .vw => .{ .value = @floatCast(parsed.value), .unit = .vw },
+        .vh => .{ .value = @floatCast(parsed.value), .unit = .vh },
+        .none => if (parsed.value == 0) .{ .unit = .px } else null,
+        else => blk: {
+            const pixels = parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse return null);
+            if (@abs(pixels) > std.math.floatMax(f32)) return null;
+            break :blk .{ .value = @floatCast(pixels), .unit = .px };
+        },
+    };
+}
+
+pub fn splitInset(value: []const u8) ?[4][]const u8 {
+    var values: [4][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
+    while (it.next()) |part| {
+        if (count == 4 or parseInset(part) == null) return null;
+        values[count] = part;
+        count += 1;
+    }
+    if (count == 0) return null;
+    if (count > 1) {
+        for (values[0..count]) |part| {
+            if (std.ascii.eqlIgnoreCase(part, "initial") or std.ascii.eqlIgnoreCase(part, "unset")) return null;
+        }
+    }
+    return .{ values[0], values[if (count > 1) 1 else 0], values[if (count > 2) 2 else 0], values[if (count > 3) 3 else if (count > 1) 1 else 0] };
+}
 
 pub const AxisPair = struct { x: []const u8, y: []const u8 };
 
