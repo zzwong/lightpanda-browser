@@ -222,7 +222,7 @@ fn createTarget(cmd: *CDP.Command) !void {
 
     // attach to the target only if auto attach is set.
     if (cmd.cdp.target_auto_attach) {
-        try doAttachtoTarget(cmd, target);
+        try doAttachtoTarget(cmd, target, true);
     }
 
     if (URL.isAboutBlank(params.url) == false) {
@@ -256,7 +256,7 @@ fn resolveTarget(bc: *const CDP.BrowserContext, target_id: []const u8) !*CDP.Tar
 fn attachToTarget(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         targetId: []const u8,
-        flatten: bool = true,
+        flatten: bool = false,
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
@@ -268,20 +268,17 @@ fn attachToTarget(cmd: *CDP.Command) !void {
     // browser session while the page session is live — get a distinct
     // auxiliary session so they don't collide with the primary one.
     if (target.session_id == null) {
-        try doAttachtoTarget(cmd, target);
+        try doAttachtoTarget(cmd, target, params.flatten);
         return cmd.sendResult(.{ .sessionId = target.session_id }, .{});
     }
 
-    // attachedToTarget is sent to the parent session. Use the message's own
-    // sessionId, not cmd.sessionId(): a message wrapped by
-    // Target.sendMessageToTarget has none, so the event is sent with no
-    // sessionId, where that client reads it. Events are never wrapped, so
-    // an event with the wrapped session's id would be missed.
-    const parent_id = if (cmd.input.session_id) |session_id|
+    // The attachment retains its parent for responses and events.
+    const parent_id = if (cmd.sessionId()) |session_id|
         cmd.cdp.resolveSessionId(session_id) orelse return error.UnknownSessionId
     else
         null;
     const session = try bc.attachSession(target, cmd.cdp.session_id_gen.next(), parent_id);
+    session.flatten = params.flatten;
 
     try cmd.sendEvent("Target.attachedToTarget", AttachToTarget{
         .sessionId = session.id,
@@ -364,16 +361,16 @@ fn sendMessageToTarget(cmd: *CDP.Command) !void {
         return error.UnknownSessionId;
     }
 
-    var aw = std.Io.Writer.Allocating.init(cmd.arena);
-    cmd.cdp.dispatch(cmd.arena, .{ .capture = &aw.writer }, params.message, params.sessionId) catch |err| {
+    cmd.cdp.dispatch(cmd.arena, .{ .wrapped = .{
+        .cdp = cmd.cdp,
+        .session_id = params.sessionId,
+        .parent_id = cmd.sessionId(),
+    } }, params.message, params.sessionId) catch |err| {
         log.debug(.cdp, "internal dispatch error", .{ .err = err, .id = cmd.input.id, .message = params.message });
         return err;
     };
 
-    try cmd.sendEvent("Target.receivedMessageFromTarget", .{
-        .message = aw.written(),
-        .sessionId = params.sessionId,
-    }, .{});
+    try cmd.sendResult(null, .{});
 }
 
 fn detachFromTarget(cmd: *CDP.Command) !void {
@@ -453,7 +450,7 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         autoAttach: bool,
         waitForDebuggerOnStart: bool,
-        flatten: bool = true,
+        flatten: bool = false,
         filter: ?[]const TargetFilter = null,
     })) orelse return error.InvalidParams;
 
@@ -467,6 +464,10 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
                 return cmd.sendResult(null, .{});
             }
         }
+    }
+
+    if (!params.flatten) {
+        return cmd.sendError(-32602, "Only flatten protocol is supported with browser level auto-attach", .{});
     }
 
     // set a flag to send Target.attachedToTarget events
@@ -498,7 +499,7 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
                         const frame = target.mainFrame() orelse continue;
                         target.target_id = id.toFrameId(frame._frame_id);
                     }
-                    try doAttachtoTarget(cmd, target);
+                    try doAttachtoTarget(cmd, target, true);
                 }
             }
         }
@@ -533,13 +534,18 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
     try cmd.sendResult(null, .{});
 }
 
-fn doAttachtoTarget(cmd: *CDP.Command, target: *CDP.Target) !void {
-    const parent_id = target.session_id;
+fn doAttachtoTarget(cmd: *CDP.Command, target: *CDP.Target, flatten: bool) !void {
+    const parent_id = if (cmd.sessionId()) |session_id|
+        cmd.cdp.resolveSessionId(session_id) orelse return error.UnknownSessionId
+    else
+        null;
 
     if (target.session_id == null) {
         // extra_headers should not be kept on a new frame or tab
         target.extra_headers.clearRetainingCapacity();
-        _ = try target.attachPrimarySession(cmd.cdp.session_id_gen.next());
+        const attached = try target.attachPrimarySession(cmd.cdp.session_id_gen.next());
+        attached.flatten = flatten;
+        attached.parent_id = parent_id;
     }
 
     try cmd.sendEvent("Target.attachedToTarget", AttachToTarget{
@@ -647,7 +653,7 @@ test "cdp.target: disposeBrowserContext detaches target sessions" {
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const target = bc.firstTarget().?;
@@ -659,7 +665,7 @@ test "cdp.target: disposeBrowserContext detaches target sessions" {
         .id = 4,
         .method = "Target.attachToTarget",
         .sessionId = "BSID-1",
-        .params = .{ .targetId = target_id },
+        .params = .{ .flatten = true, .targetId = target_id },
     });
     // the primary is attached first, the auxiliary session after it
     try testing.expectEqual(2, bc.attached_sessions.count());
@@ -788,7 +794,7 @@ test "cdp.target: createTarget" {
         var ctx = try testing.context();
         defer ctx.deinit();
         // active auto attach to get the Target.attachedToTarget event.
-        try ctx.processMessage(.{ .id = 9, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+        try ctx.processMessage(.{ .id = 9, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
         try ctx.processMessage(.{ .id = 10, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
 
         // should create a browser context
@@ -824,7 +830,7 @@ test "cdp.target: history.state on freshly created blank target doesn't crash" {
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 41, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const session_id = bc.firstTarget().?.session_id.?;
@@ -840,7 +846,7 @@ test "cdp.target: navigation.currentEntry on freshly created blank target doesn'
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 41, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const session_id = bc.firstTarget().?.session_id.?;
@@ -923,13 +929,13 @@ test "cdp.target: attachToTarget" {
     defer ctx.deinit();
 
     {
-        try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .targetId = "X" } });
+        try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = "X" } });
         try ctx.expectSentError(-31998, "BrowserContextNotLoaded", .{ .id = 10 });
     }
 
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-9" });
     {
-        try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .targetId = "TID-8" } });
+        try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = "TID-8" } });
         try ctx.expectSentError(-31998, "TargetNotLoaded", .{ .id = 10 });
     }
 
@@ -938,13 +944,13 @@ test "cdp.target: attachToTarget" {
     const target = bc.firstTarget().?;
     target.target_id = "TID-000000000B".*;
     {
-        try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .targetId = "TID-8" } });
+        try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = "TID-8" } });
         try ctx.expectSentError(-31998, "UnknownTargetId", .{ .id = 10 });
     }
 
     {
         // the first attach becomes the primary session
-        try ctx.processMessage(.{ .id = 11, .method = "Target.attachToTarget", .params = .{ .targetId = "TID-000000000B" } });
+        try ctx.processMessage(.{ .id = 11, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = "TID-000000000B" } });
         const session_id = target.session_id.?;
         try ctx.expectSentResult(.{ .sessionId = session_id }, .{ .id = 11 });
         try ctx.expectSentEvent("Target.attachedToTarget", .{ .sessionId = session_id, .targetInfo = .{ .url = "about:blank", .title = "", .attached = true, .type = "page", .canAccessOpener = false, .browserContextId = "BID-9", .targetId = target.target_id.? } }, .{});
@@ -967,7 +973,7 @@ test "cdp.target: auxiliary session is unique and routed through its parent" {
         .id = 2,
         .method = "Target.attachToTarget",
         .sessionId = "BSID-1",
-        .params = .{ .targetId = "TID-000000000B" },
+        .params = .{ .flatten = true, .targetId = "TID-000000000B" },
     });
 
     // the primary is attached first, the auxiliary session after it
@@ -1053,7 +1059,7 @@ test "cdp.target: issue#474: attach to just created target" {
         try testing.expectEqual(true, target.target_id != null);
         try ctx.expectSentResult(.{ .targetId = target.target_id.? }, .{ .id = 10 });
 
-        try ctx.processMessage(.{ .id = 11, .method = "Target.attachToTarget", .params = .{ .targetId = target.target_id.? } });
+        try ctx.processMessage(.{ .id = 11, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = target.target_id.? } });
         const session_id = target.session_id.?;
         try ctx.expectSentResult(.{ .sessionId = session_id }, .{ .id = 11 });
     }
@@ -1065,7 +1071,7 @@ test "cdp.target: detachFromTarget" {
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-9" });
     try ctx.processMessage(.{ .id = 10, .method = "Target.createTarget", .params = .{ .browserContextId = "BID-9" } });
     const target = bc.firstTarget().?;
-    try ctx.processMessage(.{ .id = 11, .method = "Target.attachToTarget", .params = .{ .targetId = target.target_id.? } });
+    try ctx.processMessage(.{ .id = 11, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = target.target_id.? } });
     const session_id = target.session_id.?;
 
     try ctx.processMessage(.{ .id = 12, .method = "Target.detachFromTarget", .params = .{ .sessionId = session_id } });
@@ -1074,7 +1080,7 @@ test "cdp.target: detachFromTarget" {
     try testing.expectEqual(null, target.session_id);
     try ctx.expectSentResult(null, .{ .id = 12 });
 
-    try ctx.processMessage(.{ .id = 13, .method = "Target.attachToTarget", .params = .{ .targetId = target.target_id.? } });
+    try ctx.processMessage(.{ .id = 13, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = target.target_id.? } });
     try testing.expect(!std.mem.eql(u8, session_id, target.session_id.?));
     try ctx.expectSentResult(.{ .sessionId = target.session_id.? }, .{ .id = 13 });
 }
@@ -1088,7 +1094,7 @@ test "cdp.target: detachFromTarget auxiliary session" {
         .target_id = "TID-000000000B".*,
     });
 
-    try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .targetId = "TID-000000000B" } });
+    try ctx.processMessage(.{ .id = 10, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = "TID-000000000B" } });
     try testing.expectEqual(2, bc.attached_sessions.count());
     const session_id = bc.attached_sessions.keys()[1];
     const target = bc.firstTarget().?;
@@ -1194,12 +1200,12 @@ test "cdp.target: setAutoAttach false sends detachedFromTarget" {
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .id = "BID-9" });
-    try ctx.processMessage(.{ .id = 10, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 10, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 11, .method = "Target.createTarget", .params = .{ .browserContextId = "BID-9" } });
     const target = bc.firstTarget().?;
     const session_id = target.session_id.?;
 
-    try ctx.processMessage(.{ .id = 12, .method = "Target.setAutoAttach", .params = .{ .autoAttach = false, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 12, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = false, .waitForDebuggerOnStart = false } });
 
     try ctx.expectSentEvent("Target.detachedFromTarget", .{ .sessionId = session_id }, .{});
     try testing.expectEqual(null, target.session_id);
@@ -1245,6 +1251,7 @@ test "cdp.target: setAutoAttach with page-exclude filter sends no attachedToTarg
         .id = 1,
         .method = "Target.setAutoAttach",
         .params = .{
+            .flatten = true,
             .autoAttach = true,
             .waitForDebuggerOnStart = false,
             .filter = [_]TargetFilter{
@@ -1266,7 +1273,7 @@ test "cdp.target: setAutoAttach without filter still sends startup attachedToTar
     try ctx.processMessage(.{
         .id = 1,
         .method = "Target.setAutoAttach",
-        .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false },
+        .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false },
     });
     try ctx.expectSentEvent("Target.attachedToTarget", .{
         .sessionId = "STARTUP",
@@ -1346,7 +1353,7 @@ test "cdp.target: late auto attach uses each context and page commands leave pee
     try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank", .browserContextId = second.id } });
     try testing.expectEqual(null, first.firstTarget().?.session_id);
     try testing.expectEqual(null, second.firstTarget().?.session_id);
-    try ctx.processMessage(.{ .id = 3, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 3, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.expectSentResult(null, .{ .id = 3 });
     try testing.expect(first.firstTarget().?.session_id != null);
     try testing.expect(second.firstTarget().?.session_id != null);
@@ -1357,7 +1364,7 @@ test "cdp.target: late auto attach uses each context and page commands leave pee
     try ctx.expectSentEvent("Target.attachedToTarget", AttachToTarget{ .sessionId = second.firstTarget().?.session_id.?, .targetInfo = targetInfo(second.firstTarget().?).? }, .{});
     const first_session = first.firstTarget().?.session_id.?;
     const second_session = second.firstTarget().?.session_id.?;
-    try ctx.processMessage(.{ .id = 4, .sessionId = first_session, .method = "Target.setAutoAttach", .params = .{ .autoAttach = false, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 4, .sessionId = first_session, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = false, .waitForDebuggerOnStart = false } });
     try ctx.expectSentResult(null, .{ .id = 4, .session_id = first_session });
     try testing.expect(cdp.target_auto_attach);
     try std.testing.expectEqualStrings(first_session, first.firstTarget().?.session_id.?);
@@ -1366,7 +1373,7 @@ test "cdp.target: late auto attach uses each context and page commands leave pee
 
 // Creates `count` targets with auto-attach on, returning them in order.
 fn createTargets(ctx: *testing.TestContext, count: usize) ![]*CDP.Target {
-    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     for (0..count) |i| {
         try ctx.processMessage(.{ .id = 100 + i, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     }
@@ -1549,7 +1556,7 @@ test "cdp.target: setAutoAttach on a page session doesn't attach new pages" {
     try ctx.processMessage(.{ .id = 1, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const first = bc.firstTarget().?;
-    try ctx.processMessage(.{ .id = 2, .method = "Target.attachToTarget", .params = .{ .targetId = &first.target_id.? } });
+    try ctx.processMessage(.{ .id = 2, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = &first.target_id.? } });
     const first_session_id = first.session_id.?;
 
     try ctx.processMessage(.{ .id = 3, .method = "Target.setAutoAttach", .sessionId = first_session_id, .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false, .flatten = true } });
@@ -1560,7 +1567,125 @@ test "cdp.target: setAutoAttach on a page session doesn't attach new pages" {
     const second = bc.targets.items[1];
     try testing.expectEqual(null, second.session_id);
 
-    try ctx.processMessage(.{ .id = 5, .method = "Target.attachToTarget", .params = .{ .targetId = &second.target_id.? } });
+    try ctx.processMessage(.{ .id = 5, .method = "Target.attachToTarget", .params = .{ .flatten = true, .targetId = &second.target_id.? } });
     try ctx.expectSentResult(.{ .sessionId = second.session_id.? }, .{ .id = 5 });
     try testing.expectEqual(2, bc.attached_sessions.count());
+}
+
+fn wrappedResults(ctx: *testing.TestContext, session_id: []const u8, message_id: i64) ![]std.json.Value {
+    var results: std.ArrayList(std.json.Value) = .empty;
+    var index: usize = 0;
+    while (try ctx.getSentMessage(index)) |message| : (index += 1) {
+        const method = message.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "Target.receivedMessageFromTarget")) continue;
+        const params = message.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("sessionId").?.string, session_id)) continue;
+        const inner = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, params.get("message").?.string, .{});
+        const inner_id = inner.object.get("id") orelse continue;
+        if (inner_id.integer == message_id) try results.append(testing.arena_allocator, inner);
+    }
+    return results.items;
+}
+
+test "cdp.target: wrapped commands acknowledge both request ids" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-W", .target_id = "TID-000000000W".*, .session_id = "SID-W" });
+    const attached = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
+    attached.flatten = false;
+    try ctx.processMessage(.{ .id = 1, .method = "Target.sendMessageToTarget", .params = .{
+        .sessionId = "SID-AUX",
+        .message = "{\"id\":101,\"method\":\"Log.enable\"}",
+    } });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    const results = try wrappedResults(&ctx, "SID-AUX", 101);
+    try testing.expectEqual(1, results.len);
+    try testing.expectEqual(0, results[0].object.get("result").?.object.count());
+    try testing.expectEqual(null, results[0].object.get("sessionId"));
+
+    try ctx.processMessage(.{ .id = 2, .method = "Target.sendMessageToTarget", .params = .{
+        .sessionId = "SID-AUX",
+        .message = "{\"id\":102,\"method\":\"Runtime.noSuchMethod\"}",
+    } });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    const errors = try wrappedResults(&ctx, "SID-AUX", 102);
+    try testing.expectEqual(1, errors.len);
+    try testing.expectEqual(-32601, errors[0].object.get("error").?.object.get("code").?.integer);
+}
+
+test "cdp.target: queued inspector replies keep their wrapped transport" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-W", .target_id = "TID-000000000W".*, .session_id = "SID-W", .url = "hi.html" });
+    const attached = try bc.attachSession(bc.firstTarget().?, "SID-AUX", null);
+    attached.flatten = false;
+    try ctx.processMessage(.{ .id = 1, .method = "Target.sendMessageToTarget", .params = .{
+        .sessionId = "SID-AUX",
+        .message = "{\"id\":101,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"new Promise(resolve => globalThis.finishWrapped = resolve)\",\"awaitPromise\":true,\"returnByValue\":true}}",
+    } });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try testing.expectEqual(0, (try wrappedResults(&ctx, "SID-AUX", 101)).len);
+    try ctx.processMessage(.{ .id = 2, .method = "Runtime.evaluate", .sessionId = "SID-W", .params = .{ .expression = "finishWrapped(73); 42", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "number", .value = 42 } }, .{ .id = 2, .session_id = "SID-W" });
+    const replies = try wrappedResults(&ctx, "SID-AUX", 101);
+    try testing.expectEqual(1, replies.len);
+    try testing.expectEqual(73, replies[0].object.get("result").?.object.get("result").?.object.get("value").?.integer);
+    try testing.expectEqual(null, replies[0].object.get("sessionId"));
+}
+
+test "cdp.target: non-flat attachment wraps domain events through its parent" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-W", .target_id = "TID-000000000W".*, .session_id = "SID-W" });
+    const attached = try bc.attachSession(bc.firstTarget().?, "SID-AUX", "SID-W");
+    attached.flatten = false;
+    try ctx.cdp().sendEvent("Log.entryAdded", .{ .entry = .{ .text = "wrapped event" } }, .{ .session_id = "SID-AUX" });
+    try ctx.expectSentEvent("Target.receivedMessageFromTarget", .{
+        .sessionId = "SID-AUX",
+        .message = "{\"method\":\"Log.entryAdded\",\"params\":{\"entry\":{\"text\":\"wrapped event\"}}}",
+    }, .{ .session_id = "SID-W" });
+}
+
+test "cdp.target: omitted flatten selects legacy attachment but is invalid for browser auto-attach" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-W", .target_id = "TID-000000000W".*, .session_id = "SID-W" });
+    try ctx.processMessage(.{ .id = 1, .method = "Target.attachToTarget", .params = .{ .targetId = "TID-000000000W" } });
+    const result = (try sentResult(&ctx, 1)).?;
+    const session_id = result.object.get("sessionId").?.string;
+    try testing.expectEqual(false, bc.attached_sessions.get(session_id).?.flatten);
+    try ctx.processMessage(.{ .id = 2, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.expectSentError(-32602, "Only flatten protocol is supported with browser level auto-attach", .{ .id = 2 });
+    try testing.expectEqual(false, ctx.cdp().target_auto_attach);
+    try ctx.processMessage(.{ .id = 3, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false, .flatten = false } });
+    try ctx.expectSentError(-32602, "Only flatten protocol is supported with browser level auto-attach", .{ .id = 3 });
+    try testing.expectEqual(false, ctx.cdp().target_auto_attach);
+}
+
+test "cdp.target: nested legacy attachment retains its effective parent" {
+    inline for (.{ false, true }) |first_attachment| {
+        var ctx = try testing.context();
+        defer ctx.deinit();
+        const targets = try createTargets(&ctx, 2);
+        const bc = targets[0].bc;
+        if (first_attachment) bc.detachTargetSessions(targets[1]);
+        const parent = try bc.attachSession(targets[0], "SID-PARENT", null);
+        parent.flatten = false;
+        const attach = try std.json.Stringify.valueAlloc(testing.arena_allocator, .{
+            .id = 101,
+            .method = "Target.attachToTarget",
+            .params = .{ .targetId = &targets[1].target_id.?, .flatten = false },
+        }, .{});
+        try ctx.processMessage(.{ .id = 1, .method = "Target.sendMessageToTarget", .params = .{ .sessionId = "SID-PARENT", .message = attach } });
+        const results = try wrappedResults(&ctx, "SID-PARENT", 101);
+        try testing.expectEqual(1, results.len);
+        const child_id = results[0].object.get("result").?.object.get("sessionId").?.string;
+        try testing.expectEqual("SID-PARENT", bc.attached_sessions.get(child_id).?.parent_id.?);
+        const nested_event = try std.json.Stringify.valueAlloc(testing.arena_allocator, .{
+            .method = "Target.receivedMessageFromTarget",
+            .params = .{ .sessionId = child_id, .message = "{\"method\":\"Log.entryAdded\",\"params\":{}}" },
+        }, .{});
+        try ctx.cdp().sendEvent("Log.entryAdded", struct {}{}, .{ .session_id = child_id });
+        try ctx.expectSentEvent("Target.receivedMessageFromTarget", .{ .sessionId = "SID-PARENT", .message = nested_event }, .{});
+    }
 }

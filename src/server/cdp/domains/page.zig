@@ -1242,7 +1242,7 @@ test "cdp.page: close detaches the target like Target.closeTarget" {
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const target = bc.firstTarget().?;
@@ -1552,7 +1552,7 @@ test "cdp.page: setLifecycleEventsEnabled reports the initial about:blank as loa
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const target = bc.firstTarget().?;
@@ -1571,7 +1571,7 @@ test "cdp.frame: isolated world survives the in-place first navigation" {
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 41, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const target = bc.firstTarget().?;
@@ -1615,7 +1615,7 @@ test "cdp.frame: isolated world follows the in-place first navigation's origin" 
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 40, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 41, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const target = bc.firstTarget().?;
@@ -2605,7 +2605,7 @@ test "cdp.frame: first navigation replaces the bootstrap about:blank global" {
     defer ctx.deinit();
 
     // A fresh, attached target sitting on its bootstrap about:blank document.
-    try ctx.processMessage(.{ .id = 69, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 69, .method = "Target.setAutoAttach", .params = .{ .flatten = true, .autoAttach = true, .waitForDebuggerOnStart = false } });
     try ctx.processMessage(.{ .id = 70, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
     const bc = ctx.cdp().browser_context.?;
     const target = bc.firstTarget().?;
