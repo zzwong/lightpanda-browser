@@ -61,9 +61,9 @@ fn dispatchKeyEvent(cmd: *CDP.Command) !void {
 
     try cmd.sendResult(null, .{});
 
-    const bc = cmd.browser_context orelse return;
+    const target = cmd.target() catch return;
     // Keys go to the focused frame, which is an iframe's when one has focus.
-    const frame = Frame.user_input.focusedFrame(bc.mainFrame() orelse return);
+    const frame = Frame.user_input.focusedFrame(target.mainFrame() orelse return);
 
     // Chrome types text only for an event carrying it: a keyDown with `text`
     // (Puppeteer, Playwright) or a `char` (chromedp, after a text-less keyDown).
@@ -86,7 +86,7 @@ fn dispatchKeyEvent(cmd: *CDP.Command) !void {
         .keyDown, .rawKeyDown => {
             const event = try KeyboardEvent.initTrusted(comptime .wrap("keydown"), opts, frame);
             const prevented = try Frame.user_input.triggerKeyDown(frame, event, text);
-            bc.suppress_next_char = prevented and text == null;
+            target.suppress_next_char = prevented and text == null;
         },
         .keyUp => {
             const event = try KeyboardEvent.initTrusted(comptime .wrap("keyup"), opts, frame);
@@ -94,13 +94,13 @@ fn dispatchKeyEvent(cmd: *CDP.Command) !void {
         },
         .char => {
             const t = text orelse return;
-            if (bc.suppress_next_char) {
-                bc.suppress_next_char = false;
+            if (target.suppress_next_char) {
+                target.suppress_next_char = false;
                 return;
             }
-            const target = Frame.user_input.focusedElement(frame) orelse return;
+            const element = Frame.user_input.focusedElement(frame) orelse return;
             const event = try KeyboardEvent.initTrusted(comptime .wrap("keypress"), opts, frame);
-            try Frame.user_input.typeChar(frame, target, event, t);
+            try Frame.user_input.typeChar(frame, element, event, t);
         },
     }
 }
@@ -137,8 +137,8 @@ fn dispatchMouseEvent(cmd: *CDP.Command) !void {
 
     try cmd.sendResult(null, .{});
 
-    const bc = cmd.browser_context orelse return;
-    const frame = bc.mainFrame() orelse return;
+    const target = cmd.target() catch return;
+    const frame = target.mainFrame() orelse return;
 
     // Map the CDP button name to the DOM MouseEvent.button value.
     // https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/button
@@ -186,11 +186,11 @@ fn dispatchTouchEvent(cmd: *CDP.Command) !void {
         .touchCancel => if (params.touchPoints.len != 0) return error.InvalidParams,
     }
 
-    const bc = cmd.browser_context orelse {
+    const target = cmd.target() catch {
         try cmd.sendResult(null, .{});
         return;
     };
-    const frame = bc.mainFrame() orelse {
+    const frame = target.mainFrame() orelse {
         try cmd.sendResult(null, .{});
         return;
     };
@@ -235,8 +235,8 @@ fn insertText(cmd: *CDP.Command) !void {
         text: []const u8, // The text to insert
     })) orelse return error.InvalidParams;
 
-    const bc = cmd.browser_context orelse return;
-    const frame = Frame.user_input.focusedFrame(bc.mainFrame() orelse return);
+    const target = cmd.target() catch return;
+    const frame = Frame.user_input.focusedFrame(target.mainFrame() orelse return);
 
     try Frame.user_input.insertText(frame, params.text);
 
@@ -1383,7 +1383,7 @@ test "cdp.input: dispatchTouchEvent reports the client's radius, angle and force
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1436,7 +1436,7 @@ test "cdp.input: dispatchTouchEvent touchStart populates touches/targetTouches/c
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1487,7 +1487,7 @@ test "cdp.input: dispatchTouchEvent preserves each event's modifier keys" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1594,7 +1594,7 @@ test "cdp.input: dispatchTouchEvent a touchStart past every element still opens 
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     try ctx.processMessage(.{
         .id = 1,
@@ -1682,7 +1682,7 @@ test "cdp.input: dispatchTouchEvent tracks the client's chosen id and rejects mi
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1758,7 +1758,7 @@ test "cdp.input: dispatchTouchEvent a second touchStart while a contact is activ
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1809,7 +1809,7 @@ test "cdp.input: dispatchTouchEvent a touchEnd carrying the released point is ac
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1863,7 +1863,7 @@ test "cdp.input: dispatchTouchEvent rejects populated touchCancel without liftin
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -1917,7 +1917,7 @@ test "cdp.input: dispatchTouchEvent a multi-point touchEnd/touchCancel is Invali
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2233,7 +2233,7 @@ test "cdp.input: dispatchKeyEvent Ctrl+A selects the whole value" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2304,7 +2304,7 @@ test "cdp.input: dispatchKeyEvent text-less keyDown then char types once" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2364,7 +2364,7 @@ test "cdp.input: a readonly textarea fires beforeinput for typed text only, a di
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2400,7 +2400,7 @@ test "cdp.input: dispatchKeyEvent char honors keypress and beforeinput vetoes" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2441,7 +2441,7 @@ test "cdp.input: dispatchKeyEvent legacy keyCode, which and charCode" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2503,7 +2503,7 @@ test "cdp.input: dispatchKeyEvent cancelled keyDown suppresses its char" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2542,7 +2542,7 @@ test "cdp.input: dispatchKeyEvent Enter clicks buttons and submits once" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2607,7 +2607,7 @@ test "cdp.input: dispatchKeyEvent Enter in a field submits through the default b
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2671,7 +2671,7 @@ test "cdp.input: typed text fires change on blur and Enter" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2749,7 +2749,7 @@ test "cdp.input: dispatchKeyEvent Enter on a checkbox, radio or select" {
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
 
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -2814,7 +2814,7 @@ test "cdp.input: touch tap emits pointer and compatibility activation in order" 
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -2855,7 +2855,7 @@ test "cdp.input: touch tap cancellation distinguishes touch pointer and mouse de
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -2970,7 +2970,7 @@ test "cdp.input: touch slop, scroll and touch-action" {
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3027,7 +3027,7 @@ test "cdp.input: consecutive taps count up" {
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3070,7 +3070,7 @@ test "cdp.input: passive prevention and finger jitter do not suppress repeated t
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3106,7 +3106,7 @@ test "cdp.input: touch tap respects disabled controls across compatibility handl
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3150,7 +3150,7 @@ test "cdp.input: touch tap revalidates targets between compatibility events" {
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3191,7 +3191,7 @@ test "cdp.input: touch cancellation retains last contact geometry through pointe
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3219,7 +3219,7 @@ test "cdp.input: re-navigating an iframe drops the pointer state on its elements
     defer ctx.deinit();
 
     const bc = try ctx.loadBrowserContext(.{ .url = "cdp/input_iframe.html" });
-    const main = bc.mainFrame().?;
+    const main = bc.firstTarget().?.mainFrame().?;
     const page = main.page;
     const child = main.child_frames.items[0];
     const text = child.document.getElementById("text") orelse unreachable;
@@ -3244,7 +3244,7 @@ test "cdp.input: a rejected touchEnd keeps the touch contact and an empty touchE
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
-    const frame = bc.mainFrame().?;
+    const frame = bc.firstTarget().?.mainFrame().?;
     var ls: lp.js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
@@ -3286,7 +3286,7 @@ test "cdp.input: navigating an iframe clears a touch contact on its child docume
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "cdp/input_iframe.html" });
-    const main = bc.mainFrame().?;
+    const main = bc.firstTarget().?.mainFrame().?;
     const child = main.child_frames.items[0];
     const target = child.document.getElementById("text") orelse unreachable;
     // CDP currently hit-tests only the main frame; seed the child contact
@@ -3318,7 +3318,7 @@ test "cdp.input: navigating an iframe keeps a touch contact on the parent docume
     var ctx = try testing.context();
     defer ctx.deinit();
     const bc = try ctx.loadBrowserContext(.{ .url = "cdp/input_iframe.html" });
-    const main = bc.mainFrame().?;
+    const main = bc.firstTarget().?.mainFrame().?;
     const target = main.document.getDocumentElement().?;
     try Frame.user_input.touchStart(main, target, .{ .x = 300, .y = 300, .id = 7 }, .{});
     var ls: lp.js.Local.Scope = undefined;

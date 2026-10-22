@@ -58,6 +58,7 @@ const Allocator = std.mem.Allocator;
 const Page = @This();
 
 session: *Session,
+viewport_override: ?Viewport = null,
 
 // DOM version used to invalidate cached state of "live" collections. Ideally
 // this would be on the Frame (and that's where it used to be). But getting the
@@ -247,12 +248,9 @@ replacement: ?*Page = null,
 // after, then frameErrorCallback does.
 destroying: bool = false,
 
-// The viewport every consumer should read. The runtime override (set via
-// Emulation.setDeviceMetricsOverride) is stored on the Browser so it persists
-// across page navigations; delegate to it here, keeping a single read path for
-// every viewport consumer.
+// CDP overrides one page target; other callers retain the session default.
 pub fn getViewport(self: *const Page) Viewport {
-    return self.session.getViewport();
+    return self.viewport_override orelse self.session.getViewport();
 }
 
 pub fn viewportChanged(self: *Page) void {
