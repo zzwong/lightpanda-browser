@@ -53,9 +53,12 @@ const ArenaPool = App.ArenaPool;
 
 const Session = @This();
 
+const PermissionMap = std.StringHashMapUnmanaged(PermissionState);
+
 browser: *Browser,
 http_client: *HttpClient,
-permissions: std.StringHashMapUnmanaged(PermissionState) = .empty,
+permissions: PermissionMap = .empty,
+origin_permissions: std.StringHashMapUnmanaged(PermissionMap) = .empty,
 geolocation_override: ?Geolocation.Override = null,
 viewport_override: ?Viewport = null,
 arena: *lp.Arena,
@@ -206,21 +209,64 @@ pub fn setHttpClient(self: *Session, client: *HttpClient) void {
 }
 
 pub fn setPermission(self: *Session, name: []const u8, state: PermissionState) !void {
+    try setPermissionInMap(&self.permissions, self.browser.allocator, name, state);
+}
+
+pub fn setOriginPermission(self: *Session, origin: []const u8, name: []const u8, state: PermissionState) !void {
     const allocator = self.browser.allocator;
-    const gop = try self.permissions.getOrPut(allocator, name);
+    const origin_gop = try self.origin_permissions.getOrPut(allocator, origin);
+    if (!origin_gop.found_existing) {
+        origin_gop.value_ptr.* = .empty;
+        origin_gop.key_ptr.* = allocator.dupe(u8, origin) catch |err| {
+            _ = self.origin_permissions.remove(origin);
+            return err;
+        };
+    }
+
+    setPermissionInMap(origin_gop.value_ptr, allocator, name, state) catch |err| {
+        if (!origin_gop.found_existing) {
+            var removed = self.origin_permissions.fetchRemove(origin) orelse unreachable;
+            removed.value.deinit(allocator);
+            allocator.free(removed.key);
+        }
+        return err;
+    };
+}
+
+pub fn getPermission(self: *const Session, origin: ?[]const u8, name: []const u8) PermissionState {
+    if (origin) |key| {
+        if (self.origin_permissions.get(key)) |permissions| {
+            if (permissions.get(name)) |state| return state;
+        }
+    }
+    return self.permissions.get(name) orelse .prompt;
+}
+
+pub fn clearPermissions(self: *Session) void {
+    const allocator = self.browser.allocator;
+    var origin_it = self.origin_permissions.iterator();
+    while (origin_it.next()) |origin_entry| {
+        var permission_it = origin_entry.value_ptr.keyIterator();
+        while (permission_it.next()) |key| allocator.free(key.*);
+        origin_entry.value_ptr.deinit(allocator);
+        allocator.free(origin_entry.key_ptr.*);
+    }
+    self.origin_permissions.clearRetainingCapacity();
+
+    var it = self.permissions.keyIterator();
+    while (it.next()) |key| allocator.free(key.*);
+    self.permissions.clearRetainingCapacity();
+}
+
+fn setPermissionInMap(map: *PermissionMap, allocator: std.mem.Allocator, name: []const u8, state: PermissionState) !void {
+    const gop = try map.getOrPut(allocator, name);
     if (!gop.found_existing) {
         gop.key_ptr.* = allocator.dupe(u8, name) catch |err| {
-            _ = self.permissions.remove(name);
+            _ = map.remove(name);
             return err;
         };
     }
     gop.value_ptr.* = state;
-}
-
-pub fn clearPermissions(self: *Session) void {
-    var it = self.permissions.keyIterator();
-    while (it.next()) |key| self.browser.allocator.free(key.*);
-    self.permissions.clearRetainingCapacity();
 }
 
 pub fn deinit(self: *Session) void {
@@ -246,6 +292,7 @@ pub fn deinit(self: *Session) void {
     self.cookie_jar.deinit();
     self.clearPermissions();
     self.permissions.deinit(self.browser.allocator);
+    self.origin_permissions.deinit(self.browser.allocator);
 
     {
         // Every context is disposed; this GC must not arm a termination.
@@ -1156,6 +1203,55 @@ pub const PageHandle = struct {
 };
 
 const testing = @import("../testing.zig");
+test "Session: origin permissions override global permissions by port and clear together" {
+    const session = testing.test_session;
+    session.clearPermissions();
+    defer session.clearPermissions();
+
+    try session.setPermission("geolocation", .granted);
+    try session.setPermission("notifications", .denied);
+    try session.setOriginPermission("https://permissions.example:8443", "geolocation", .denied);
+    try session.setOriginPermission("https://permissions.example:8444", "geolocation", .granted);
+
+    try testing.expectEqual(.denied, session.getPermission("https://permissions.example:8443", "geolocation"));
+    try testing.expectEqual(.granted, session.getPermission("https://permissions.example:8444", "geolocation"));
+    try testing.expectEqual(.granted, session.getPermission("https://permissions.example:8445", "geolocation"));
+    try testing.expectEqual(.denied, session.getPermission("https://permissions.example:8443", "notifications"));
+    try testing.expectEqual(.granted, session.getPermission(null, "geolocation"));
+    try testing.expectEqual(.prompt, session.getPermission("https://permissions.example:8443", "camera"));
+
+    session.clearPermissions();
+    try testing.expectEqual(@as(usize, 0), session.permissions.count());
+    try testing.expectEqual(@as(usize, 0), session.origin_permissions.count());
+    try testing.expectEqual(.prompt, session.getPermission("https://permissions.example:8443", "geolocation"));
+}
+
+test "Session: failed origin permission insertion rolls back allocations" {
+    const session = testing.test_session;
+    session.clearPermissions();
+    defer session.clearPermissions();
+
+    const allocator = session.browser.allocator;
+    try session.origin_permissions.ensureTotalCapacity(allocator, 1);
+
+    for (0..3) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const result = blk: {
+            session.browser.allocator = failing_allocator.allocator();
+            defer session.browser.allocator = allocator;
+            break :blk session.setOriginPermission("https://allocation.example", "geolocation", .denied);
+        };
+
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expect(failing_allocator.has_induced_failure);
+        try testing.expectEqual(failing_allocator.allocations, failing_allocator.deallocations);
+        try testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+        try testing.expectEqual(@as(usize, 0), session.origin_permissions.count());
+        try testing.expectEqual(@as(usize, 0), session.permissions.count());
+        try testing.expectEqual(.prompt, session.getPermission("https://allocation.example", "geolocation"));
+    }
+}
+
 test "Session: retiring a pending page destroys it once" {
     const session = testing.test_session;
     defer session.closeAllPages();

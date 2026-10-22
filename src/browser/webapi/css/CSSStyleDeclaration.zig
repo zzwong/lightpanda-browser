@@ -165,6 +165,17 @@ fn propertyValue(self: *const CSSStyleDeclaration, normalized: []const u8, wrapp
 /// shorthand reads as its longhands when both are present with the same
 /// priority, the way the CSSOM serializes a shorthand.
 pub fn declaredValue(self: *const CSSStyleDeclaration, name: String, frame: *Frame) ?[]const u8 {
+    if (name.eql(comptime .wrap("inset"))) {
+        const parts = self.insetProperties() orelse return null;
+        const top = parts[0]._value.str();
+        const right = parts[1]._value.str();
+        const bottom = parts[2]._value.str();
+        const left = parts[3]._value.str();
+        if (!std.mem.eql(u8, right, left)) return frame.local_arena.print("{s} {s} {s} {s}", .{ top, right, bottom, left }) catch null;
+        if (!std.mem.eql(u8, top, bottom)) return frame.local_arena.print("{s} {s} {s}", .{ top, right, bottom }) catch null;
+        if (!std.mem.eql(u8, top, right)) return frame.local_arena.print("{s} {s}", .{ top, right }) catch null;
+        return top;
+    }
     if (CssParser.axisShorthand(name.str())) |shorthand| {
         const x = self.findProperty(.wrap(shorthand.x)) orelse return null;
         const pair = self.axisPair(x) orelse return null;
@@ -174,6 +185,15 @@ pub fn declaredValue(self: *const CSSStyleDeclaration, name: String, frame: *Fra
     }
     const prop = self.findProperty(name) orelse return null;
     return prop._value.str();
+}
+
+fn insetProperties(self: *const CSSStyleDeclaration) ?[4]*const Property {
+    var parts: [4]*const Property = undefined;
+    for (CssParser.inset_sides, &parts) |side, *part| {
+        part.* = self.findProperty(.wrap(side)) orelse return null;
+        if (part.*._important != parts[0]._important) return null;
+    }
+    return parts;
 }
 
 /// Both longhands of an axis shorthand, declared with the same priority: the
@@ -282,6 +302,10 @@ pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []co
 
 /// Whether a declared property is !important; false when it isn't declared.
 pub fn declaredImportant(self: *const CSSStyleDeclaration, name: String) bool {
+    if (name.eql(comptime .wrap("inset"))) {
+        const parts = self.insetProperties() orelse return false;
+        return parts[0]._important;
+    }
     if (CssParser.axisShorthand(name.str())) |shorthand| {
         const x = self.findProperty(.wrap(shorthand.x)) orelse return false;
         const pair = self.axisPair(x) orelse return false;
@@ -315,6 +339,13 @@ pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value:
 /// not override an earlier !important one (CSS cascade precedence).
 fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Declaration, frame: *Frame) !void {
     const normalized = normalizePropertyName(frame.local_arena, declaration.name);
+    if (std.ascii.eqlIgnoreCase(normalized, "inset")) {
+        const values = CssParser.splitInset(declaration.value) orelse return;
+        for (CssParser.inset_sides, values) |side, value| {
+            try self.applyParsedDeclaration(.{ .name = side, .value = value, .important = declaration.important }, frame);
+        }
+        return;
+    }
     if (CssParser.axisShorthand(normalized)) |shorthand| {
         const values = CssParser.splitAxisPair(declaration.value) orelse return;
         try self.applyParsedDeclaration(.{ .name = shorthand.x, .value = values.x, .important = declaration.important }, frame);
@@ -341,6 +372,15 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
     }
 
     const normalized = normalizePropertyName(frame.local_arena, property_name);
+    if (std.ascii.eqlIgnoreCase(normalized, "inset")) {
+        const values = CssParser.splitInset(value) orelse return false;
+        var changed = false;
+        for (CssParser.inset_sides, values) |side, part| {
+            const side_changed = try self.setPropertyImpl(side, part, important, frame);
+            changed = changed or side_changed;
+        }
+        return changed;
+    }
     if (CssParser.axisShorthand(normalized)) |shorthand| {
         const values = CssParser.splitAxisPair(value) orelse return false;
         const x = try self.setPropertyImpl(shorthand.x, values.x, important, frame);
@@ -384,6 +424,15 @@ pub fn removeProperty(self: *CSSStyleDeclaration, property_name: []const u8, fra
 
 fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, frame: *Frame) !?[]const u8 {
     const normalized = normalizePropertyName(frame.local_arena, property_name);
+    if (std.ascii.eqlIgnoreCase(normalized, "inset")) {
+        const old_value = try frame.call_arena.dupe(u8, self.declaredValue(.wrap("inset"), frame) orelse "");
+        var removed = false;
+        for (CssParser.inset_sides) |side| {
+            const previous = try self.removePropertyImpl(side, frame);
+            removed = removed or previous != null;
+        }
+        return if (removed) old_value else null;
+    }
     if (CssParser.axisShorthand(normalized)) |shorthand| {
         const old_value = self.declaredValue(.wrap(shorthand.name), frame) orelse "";
         const x = try self.removePropertyImpl(shorthand.x, frame);
@@ -1250,6 +1299,19 @@ test "writeCssNumber: six significant digits" {
         try writeCssNumber(&writer, c[0]);
         try testing.expectEqual(c[1], writer.buffered());
     }
+}
+
+test "removing inset preserves the returned owned value" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var style = CSSStyleDeclaration{};
+    defer style.clearProperties(frame);
+    const value = "1234567890123px";
+    try style.setProperty("inset", value, "important", frame);
+    const removed = try style.removeProperty("inset", frame);
+    try testing.expectEqual(value, removed);
+    try testing.expectEqual(@as(u32, 0), style.length());
 }
 
 test "CSS property value storage is reused" {

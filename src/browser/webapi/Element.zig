@@ -1659,6 +1659,11 @@ fn viewportAxis(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
 
 // Caller must have made sure self is visible.
 pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    if (self.positionedClientRect(frame)) |rect| return @field(rect, @tagName(axis));
+    return self.unpositionedBoxAxis(frame, axis);
+}
+
+fn unpositionedBoxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
     if (axis == .width) {
         const owner = self.ownerFrame(frame) orelse return self.getElementAxis(frame, .width).value;
         return self.boxWidth(owner);
@@ -1820,14 +1825,76 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
 
 // Some cases need the bounding rect but have already done the visibility check.
 pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+    return self.clientRectAt(frame, 0);
+}
+
+fn clientRectAt(self: *Element, frame: *Frame, depth: u8) DOMRect.Data {
+    if (self.positionedClientRectAt(frame, depth)) |rect| return rect;
     // Client rects are viewport-relative: offset the faux-layout document
     // position by the owning window's scroll position.
     const window = (self.ownerFrame(frame) orelse frame).window;
     return .{
         .x = self.horizontalPosition(frame) - @as(f64, @floatFromInt(window.getScrollX())),
         .y = calculateDocumentPosition(self.asNode(), frame) - @as(f64, @floatFromInt(window.getScrollY())),
-        .width = self.boxAxis(frame, .width),
-        .height = self.boxAxis(frame, .height),
+        .width = self.unpositionedBoxAxis(frame, .width),
+        .height = self.unpositionedBoxAxis(frame, .height),
+    };
+}
+
+/// Physical insets for absolute/fixed boxes. Normal flow, borders, margins,
+/// transformed containing blocks and replaced-element sizing remain approximate.
+pub fn positionedClientRect(self: *Element, frame: *Frame) ?DOMRect.Data {
+    return self.positionedClientRectAt(frame, 0);
+}
+
+fn positionedClientRectAt(self: *Element, frame: *Frame, depth: u8) ?DOMRect.Data {
+    if (depth >= 64) return null;
+    const owner = self.ownerFrame(frame) orelse return null;
+    const sm = &owner._style_manager;
+    const position = sm.stackingProps(self).position;
+    if (position != .absolute and position != .fixed) return null;
+    const insets = sm.positioningInsets(self);
+    if (insets.top.unit == .auto and insets.right.unit == .auto and insets.bottom.unit == .auto and insets.left.unit == .auto) return null;
+    const viewport = frame.page.getViewport();
+    const scroll_x: f64 = @floatFromInt(owner.window.getScrollX());
+    const scroll_y: f64 = @floatFromInt(owner.window.getScrollY());
+    var containing: DOMRect.Data = .{
+        .x = if (position == .fixed) 0 else -scroll_x,
+        .y = if (position == .fixed) 0 else -scroll_y,
+        .width = @floatFromInt(viewport.width),
+        .height = @floatFromInt(viewport.height),
+    };
+    var parent = self.asNode().flatTreeParentElement(frame);
+    while (parent) |p| : (parent = p.asNode().flatTreeParentElement(frame)) {
+        const props = sm.stackingProps(p);
+        if ((position == .absolute and props.positioned()) or props.transform_context) {
+            containing = p.clientRectAt(frame, depth + 1);
+            break;
+        }
+    }
+    const left = insets.left.resolve(containing.width, viewport);
+    const right = insets.right.resolve(containing.width, viewport);
+    const top = insets.top.resolve(containing.height, viewport);
+    const bottom = insets.bottom.resolve(containing.height, viewport);
+    const own_width = self.getElementAxis(frame, .width);
+    const own_height = self.getElementAxis(frame, .height);
+    var width = self.unpositionedBoxAxis(frame, .width);
+    var height = self.unpositionedBoxAxis(frame, .height);
+    if (!own_width.explicit and sm.hasAutoWidth(self) and left != null and right != null) {
+        width = self.clampWidth(@max(0, containing.width - left.? - right.?), .box, owner);
+    }
+    if (!own_height.explicit and top != null and bottom != null) height = @max(0, containing.height - top.? - bottom.?);
+    var translate_x: f64 = 0;
+    if (left != null or right != null) {
+        if (self.inlineStyle(frame)) |style| {
+            translate_x = CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+        }
+    }
+    return .{
+        .x = translate_x + if (left) |v| containing.x + v else if (right) |v| containing.x + containing.width - v - width else self.horizontalPosition(frame) - scroll_x,
+        .y = if (top) |v| containing.y + v else if (bottom) |v| containing.y + containing.height - v - height else calculateDocumentPosition(self.asNode(), frame) - scroll_y,
+        .width = width,
+        .height = height,
     };
 }
 
