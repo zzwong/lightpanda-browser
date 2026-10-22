@@ -654,7 +654,7 @@ test "tests:afterAll" {
 fn serveCDP(wg: *lp.WaitGroup) !void {
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
 
-    test_cdp_server = Server.init(test_app, address) catch |err| {
+    test_cdp_server = Server.init(test_app, .{ .ip = address }) catch |err| {
         std.debug.print("CDP server error: {}", .{err});
         return err;
     };
@@ -1159,6 +1159,18 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         return req.respond(".ext-hide-2 { display: none; }", .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "text/css" },
+            },
+        });
+    }
+
+    // Latin-1 bytes in the reason phrase, a header name and a header value.
+    if (std.mem.eql(u8, path, "/latin1_response")) {
+        return req.respond("latin1", .{
+            .reason = "Caf\xE9",
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "X-Latin1", .value = "La\xA0Paz" },
+                .{ .name = "X-Caf\xE9", .value = "1" },
             },
         });
     }

@@ -459,9 +459,9 @@ pub fn setTextContent(self: *Node, data: []const u8, frame: *Frame) !void {
         .element => {
             const el = self.subtype(Element);
             if (data.len == 0) {
-                return el.replaceChildren(&.{}, frame);
+                return el.replaceChildren(.init(&.{}), frame);
             }
-            return el.replaceChildren(&.{.{ .text = data }}, frame);
+            return el.replaceChildren(.init(&.{.{ .text = data }}), frame);
         },
         // Per spec, setting textContent on CharacterData runs replaceData(0, length, value)
         .cdata => {
@@ -473,17 +473,17 @@ pub fn setTextContent(self: *Node, data: []const u8, frame: *Frame) !void {
         .document_fragment => {
             const frag = self.subtype(DocumentFragment);
             if (data.len == 0) {
-                return frag.replaceChildren(&.{}, frame);
+                return frag.replaceChildren(.init(&.{}), frame);
             }
-            return frag.replaceChildren(&.{.{ .text = data }}, frame);
+            return frag.replaceChildren(.init(&.{.{ .text = data }}), frame);
         },
         .attribute => return self.subtype(Element.Attribute).setValue(.wrap(data), frame),
     }
 }
 
-pub fn getNodeName(self: *const Node, buf: []u8) []const u8 {
+pub fn getNodeName(self: *const Node, allocator: Allocator) []const u8 {
     return switch (self._type) {
-        .element => self.subtype(Element).getTagNameSpec(buf),
+        .element => self.subtype(Element).getTagNameSpec(allocator),
         .cdata => {
             const cd = self.subtype(CData);
             return switch (cd._type) {
@@ -1423,7 +1423,10 @@ pub fn getElementsByTagName(self: *Node, tag_name: []const u8, frame: *Frame) !G
         };
     }
 
-    const lower = std.ascii.lowerString(&frame.buf, tag_name);
+    const lower = if (Element.Attribute.needsLowerCasing(tag_name))
+        try std.ascii.allocLowerString(frame.local_arena, tag_name)
+    else
+        tag_name;
     if (Node.Element.Tag.parseForMatch(lower)) |known| {
         // optimized for known tag names, comparison
         return .{
@@ -1511,6 +1514,35 @@ pub fn prependNodes(self: *Node, nodes: []const NodeOrText, frame: *Frame) !void
     // The reference child is evaluated after converting nodes into the
     // fragment: one of the arguments may be the current first child.
     _ = try self.insertBefore(fragment_node, self.firstChild(), frame);
+}
+
+/// Element and CharacterData replaceWith.
+pub fn replaceWithNodes(self: *Node, nodes: []const NodeOrText, frame: *Frame) !void {
+    const parent = self._parent orelse return;
+    const viable_next = NodeOrText.viableNextSibling(self, nodes);
+
+    if (nodes.len == 1) {
+        const node = try nodes[0].toNode(self.getDocument(frame));
+        _ = try parent.replaceChild(node, self, frame);
+        return;
+    }
+
+    const fragment = try DocumentFragment.init(self.getDocument(frame), frame);
+    const fragment_node = fragment.asNode();
+    defer if (fragment_node.firstChild() == null) {
+        frame._factory.destroy(fragment);
+    };
+    for (nodes) |node_or_text| {
+        const child = try node_or_text.toNode(self.getDocument(frame));
+        _ = try fragment_node.appendChild(child, frame);
+    }
+
+    // self may itself be one of the nodes, now moved into the fragment.
+    if (self._parent == parent) {
+        _ = try parent.replaceChild(fragment_node, self, frame);
+    } else {
+        _ = try parent.insertBefore(fragment_node, viable_next, frame);
+    }
 }
 
 /// Shared implementation of replaceChildren for Element, Document, and DocumentFragment.
@@ -1776,6 +1808,18 @@ pub fn flatTreeParentElement(self: *Node, frame: *const Frame) ?*Element {
     return (parent.flatTreeParent(frame) orelse return null).is(Element);
 }
 
+/// Like flatTreeParent, but never a shadow root: the parent as
+/// TreeWalker.Flat walks, which doesn't visit shadow roots.
+pub fn flatParent(self: *Node, frame: *const Frame) ?*Node {
+    const parent = self.flatTreeParent(frame) orelse return null;
+    // A shadow tree's top-level nodes have the shadow root as their parent;
+    // skip to its host.
+    if (parent.is(ShadowRoot)) |shadow| {
+        return shadow._host.asNode();
+    }
+    return parent;
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Node);
 
@@ -1806,7 +1850,7 @@ pub const JsApi = struct {
 
     pub const nodeName = bridge.accessor(struct {
         fn wrap(self: *const Node, frame: *Frame) []const u8 {
-            return self.getNodeName(&frame.buf);
+            return self.getNodeName(frame.local_arena);
         }
     }.wrap, null, .{});
     pub const nodeType = bridge.accessor(Node.getNodeType, null, .{});
@@ -1868,7 +1912,10 @@ pub const JsApi = struct {
     fn _getRootNode(self: *Node, opts: ?GetRootNodeOpts) *Node {
         return self.getRootNode(opts orelse .{});
     }
-    pub const isEqualNode = bridge.function(Node.isEqualNode, .{});
+    pub const isEqualNode = bridge.function(_isEqualNode, .{});
+    fn _isEqualNode(self: *Node, other: js.Nullable(*Node)) bool {
+        return self.isEqualNode(other.value orelse return false);
+    }
     pub const lookupNamespaceURI = bridge.function(_lookupNamespaceURI, .{});
     fn _lookupNamespaceURI(self: *Node, prefix: js.Nullable([]const u8), frame: *Frame) ?[]const u8 {
         return self.lookupNamespaceURI(prefix.value, frame);

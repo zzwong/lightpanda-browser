@@ -242,6 +242,10 @@ pub fn getProtocol(raw: []const u8) []const u8 {
     return raw[0 .. pos + 1];
 }
 
+pub fn isRemoteScheme(raw: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(raw, "http:") or std.ascii.startsWithIgnoreCase(raw, "https:");
+}
+
 pub fn isSecure(raw: []const u8) bool {
     return std.mem.startsWith(u8, raw, "https:") or std.mem.startsWith(u8, raw, "wss:");
 }
@@ -265,6 +269,14 @@ pub fn isLoopbackHost(hostname: []const u8) bool {
         .ip4 => |ip4| ip4.bytes[0] == 127,
         .ip6 => |ip6| std.mem.eql(u8, &ip6.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
     };
+}
+
+/// Whether `hostname` is `suffix` or one of its subdomains.
+pub fn isSubdomainOf(hostname: []const u8, suffix: []const u8) bool {
+    if (hostname.len == suffix.len) return std.mem.eql(u8, hostname, suffix);
+    if (hostname.len < suffix.len + 1) return false;
+    const at = hostname.len - suffix.len;
+    return hostname[at - 1] == '.' and std.mem.eql(u8, hostname[at..], suffix);
 }
 
 pub fn getHostname(raw: []const u8) []const u8 {
