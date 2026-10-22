@@ -2807,7 +2807,8 @@ test "user_input: retained fork shadow mouse rects are viewport relative and nat
     try testing.expectEqual(host_rect.y + 5, rect.y);
     const x = rect.x + 1;
     const y = rect.y + 1;
-    try testing.expect((try frame.document.elementFromPoint(x, y, frame)) == host);
+    const public_hit = try ls.local.compileAndRun(try std.fmt.allocPrint(frame.local_arena, "document.elementFromPoint({d}, {d}) === document.getElementById('host')", .{ x, y }), null);
+    try testing.expect(public_hit.isTrue());
     try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
     try triggerMouseMove(frame, x, y);
     try triggerMousePress(frame, x, y, mouse_button.main, 1);
