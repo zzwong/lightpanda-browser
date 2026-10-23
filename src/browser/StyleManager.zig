@@ -2018,8 +2018,8 @@ const Text = struct {
     };
 };
 
-/// `inherit`, `unset` and `revert` are not handled, so they drop the
-/// declaration. `initial` is the initial value, static.
+/// Position is not inherited, so `unset` resets to static like `initial`.
+/// `inherit` and `revert` are not handled, so they drop the declaration.
 pub const Position = enum(u3) {
     static,
     relative,
@@ -2030,7 +2030,7 @@ pub const Position = enum(u3) {
     // Null for an invalid value, which drops the declaration.
     fn parse(value: []const u8) ?Position {
         const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        if (std.ascii.eqlIgnoreCase(trimmed, "static") or std.ascii.eqlIgnoreCase(trimmed, "initial")) return .static;
+        if (std.ascii.eqlIgnoreCase(trimmed, "static") or std.ascii.eqlIgnoreCase(trimmed, "initial") or std.ascii.eqlIgnoreCase(trimmed, "unset")) return .static;
         if (std.ascii.eqlIgnoreCase(trimmed, "relative")) return .relative;
         if (std.ascii.eqlIgnoreCase(trimmed, "absolute")) return .absolute;
         if (std.ascii.eqlIgnoreCase(trimmed, "fixed")) return .fixed;
@@ -2102,7 +2102,7 @@ const Stacking = struct {
 
         fn apply(self: *Declared, name: []const u8, value: []const u8) void {
             if (std.ascii.eqlIgnoreCase(name, "position")) {
-                self.position = if (std.ascii.eqlIgnoreCase(value, "unset")) .static else Position.parse(value);
+                self.position = Position.parse(value);
             } else if (std.ascii.eqlIgnoreCase(name, "z-index")) {
                 if (std.ascii.eqlIgnoreCase(value, "auto") or std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "unset")) {
                     self.z_index = @as(?i32, null);
@@ -2617,6 +2617,51 @@ test "StyleManager: position parsing agrees with stacking and flow" {
     var stacking: Stacking.Declared = .{ .position = .absolute };
     stacking.apply("position", "unset");
     try std.testing.expectEqual(@as(?Position, .static), stacking.position);
+}
+
+test "StyleManager: inline position unset resets stylesheet flow and stacking" {
+    try testing.expectEqual(@as(?Position, .static), Position.parse(" \tUnSeT\n"));
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div class=abs><span></span></div><div class=fix><span></span></div>");
+    const absolute = body.firstChild().?.as(Element);
+    const fixed = absolute.asNode().nextSibling().?.as(Element);
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(".abs { position: absolute; top: 90px; left: 80px } .fix { position: fixed; top: 90px; left: 80px }", frame);
+    _ = try body.insertBefore(style_el.asNode(), absolute.asNode(), frame);
+
+    for ([_]*Element{ absolute, fixed }, [_]Position{ .absolute, .fixed }) |el, original_position| {
+        const child = el.asNode().firstChild().?.as(Element);
+        try testing.expectEqual(original_position, sm.position(el));
+        try testing.expectEqual(original_position, sm.stackingProps(el).position);
+        try testing.expectEqual(original_position == .fixed, sm.inFixedBox(child));
+        try testing.expectEqual(true, sm.widthSizing(el) == .shrink);
+        try testing.expectEqual(true, el.positionedClientRect(frame) != null);
+
+        try el.setStyle("position: unset", frame);
+        try testing.expectEqual(Position.static, sm.position(el));
+        const flow = sm.flowProps(el);
+        try testing.expectEqual(Position.static, flow.position);
+        try testing.expectEqual(false, flow.position.outOfFlow());
+        try testing.expectEqual(false, flow.in_fixed);
+        const stacking = sm.stackingProps(el);
+        try testing.expectEqual(Position.static, stacking.position);
+        try testing.expectEqual(false, stacking.positioned());
+        try testing.expectEqual(false, stacking.createsContext());
+        try testing.expectEqual(false, sm.inFixedBox(el));
+        try testing.expectEqual(false, sm.inFixedBox(child));
+        try testing.expectEqual(true, sm.isBlockLevel(el));
+        try testing.expectEqual(true, sm.widthSizing(el) == .fill);
+        try testing.expectEqual(true, el.positionedClientRect(frame) == null);
+        try testing.expectEqual(@as(?*Element, body.as(Element)), child.getOffsetParent(frame));
+    }
 }
 
 test "StyleManager: position" {
