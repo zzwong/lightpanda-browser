@@ -2182,10 +2182,20 @@ fn calculateDocumentPosition(node: *Node, frame: *const Frame) f64 {
     // Walk up to root, counting preceding nodes
     while (current.flatParent(frame)) |parent| {
         // Count all previous siblings and their descendants
-        var siblings: TreeWalker.FlatChildren = .init(parent, .{ .frame = frame });
-        while (siblings.next()) |s| {
-            if (s == current) break;
-            position += countSubtreeNodes(s, frame);
+        const assigned: []const *Node = if (parent.is(Html.Slot)) |slot| slot._assigned.items else &.{};
+        if (assigned.len > 0) {
+            // The maintained list is already in flat-tree order; avoid searching
+            // it again on every sibling advance.
+            for (assigned) |s| {
+                if (s == current) break;
+                position += countSubtreeNodes(s, frame);
+            }
+        } else {
+            var siblings: TreeWalker.FlatChildren = .init(parent, .{ .frame = frame });
+            while (siblings.next()) |s| {
+                if (s == current) break;
+                position += countSubtreeNodes(s, frame);
+            }
         }
 
         // Count the parent itself

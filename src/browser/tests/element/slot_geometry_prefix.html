@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<body></body>
+
+<script id="named_and_default_assignment">
+function expectSlotPosition(anchor, element, delta) {
+  testing.expectEqual(delta, element.offsetTop - anchor.offsetTop);
+  testing.expectEqual(delta, element.getBoundingClientRect().top - anchor.getBoundingClientRect().top);
+}
+function geometryHost(options = {mode: 'open'}) {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  return {host, root: host.attachShadow(options)};
+}
+{
+  const {host, root} = geometryHost();
+  const named = document.createElement('slot');
+  named.name = 'lane';
+  const defaultSlot = document.createElement('slot');
+  root.append(named, defaultSlot);
+  const a = document.createElement('div');
+  const b = document.createElement('div');
+  const c = document.createElement('div');
+  const text = document.createTextNode('assigned text');
+  a.slot = b.slot = 'lane';
+  host.append(a, text, b, c);
+  testing.expectEqual([a, b], named.assignedNodes());
+  testing.expectEqual([text, c], defaultSlot.assignedNodes());
+  // Each empty assigned element and the assigned Text occupy one 5px step.
+  expectSlotPosition(named, a, 5);
+  expectSlotPosition(named, b, 10);
+  expectSlotPosition(defaultSlot, c, 10);
+
+  b.slot = '';
+  testing.expectEqual([a], named.assignedNodes());
+  testing.expectEqual([text, b, c], defaultSlot.assignedNodes());
+  expectSlotPosition(defaultSlot, b, 10);
+  expectSlotPosition(defaultSlot, c, 15);
+  b.slot = 'lane';
+  named.name = 'other';
+  testing.expectEqual([], named.assignedNodes());
+  expectSlotPosition(defaultSlot, c, 10);
+  named.name = 'lane';
+  testing.expectEqual([a, b], named.assignedNodes());
+  expectSlotPosition(named, b, 10);
+  host.remove();
+}
+</script>
+
+<script id="manual_order_duplicates_and_reassignment">
+{
+  const {host, root} = geometryHost({mode: 'open', slotAssignment: 'manual'});
+  const first = document.createElement('slot');
+  const second = document.createElement('slot');
+  root.append(first, second);
+  const a = document.createElement('div');
+  const b = document.createElement('div');
+  const c = document.createElement('div');
+  const outsider = document.createElement('div');
+  host.append(a, b, c);
+  first.assign(c, b, a);
+  testing.expectEqual([c, b, a], first.assignedNodes());
+  expectSlotPosition(first, c, 5);
+  expectSlotPosition(first, b, 10);
+  expectSlotPosition(first, a, 15);
+
+  first.assign(c, c, a, c, b);
+  testing.expectEqual([c, a, b], first.assignedNodes());
+  expectSlotPosition(first, a, 10);
+  expectSlotPosition(first, b, 15);
+  second.assign(a);
+  testing.expectEqual([c, b], first.assignedNodes());
+  testing.expectEqual([a], second.assignedNodes());
+  expectSlotPosition(first, b, 10);
+  expectSlotPosition(first, second, 15);
+  expectSlotPosition(second, a, 5);
+
+  first.assign(outsider, b, b, c);
+  testing.expectEqual([b, c], first.assignedNodes());
+  expectSlotPosition(first, b, 5);
+  expectSlotPosition(first, c, 10);
+  host.remove();
+}
+</script>
+
+<script id="manual_removal_and_reinsertion">
+{
+  const {host, root} = geometryHost({mode: 'open', slotAssignment: 'manual'});
+  const slot = document.createElement('slot');
+  root.appendChild(slot);
+  const a = document.createElement('div');
+  const b = document.createElement('div');
+  host.append(a, b);
+  slot.assign(b, a);
+  expectSlotPosition(slot, a, 10);
+  b.remove();
+  testing.expectEqual([a], slot.assignedNodes());
+  expectSlotPosition(slot, a, 5);
+  host.appendChild(b);
+  testing.expectEqual([b, a], slot.assignedNodes());
+  expectSlotPosition(slot, b, 5);
+  expectSlotPosition(slot, a, 10);
+
+  slot.remove();
+  testing.expectEqual([], slot.assignedNodes());
+  root.appendChild(slot);
+  testing.expectEqual([b, a], slot.assignedNodes());
+  expectSlotPosition(slot, a, 10);
+  host.remove();
+  document.body.appendChild(host);
+  expectSlotPosition(slot, a, 10);
+  host.remove();
+}
+</script>
+
+<script id="fallback_transitions_and_inactive_fallback">
+{
+  const {host, root} = geometryHost();
+  const slot = document.createElement('slot');
+  const fallback = document.createElement('div');
+  fallback.appendChild(document.createElement('i'));
+  const following = document.createElement('div');
+  slot.append(fallback, following);
+  root.appendChild(slot);
+  testing.expectEqual([], slot.assignedNodes());
+  expectSlotPosition(slot, fallback, 5);
+  expectSlotPosition(slot, following, 15);
+
+  const a = document.createElement('div');
+  const b = document.createElement('div');
+  host.appendChild(a);
+  testing.expectEqual([a], slot.assignedNodes());
+  expectSlotPosition(slot, a, 5);
+  // An inactive fallback query keeps the existing no-match coordinate:
+  // the full assigned prefix plus the slot, even though it is not rendered.
+  expectSlotPosition(slot, fallback, 10);
+  expectSlotPosition(slot, following, 10);
+  a.remove();
+  expectSlotPosition(slot, following, 15);
+  fallback.appendChild(document.createElement('b'));
+  expectSlotPosition(slot, following, 20);
+  host.append(a, b);
+  expectSlotPosition(slot, b, 10);
+  expectSlotPosition(slot, fallback, 15);
+  expectSlotPosition(slot, following, 15);
+  host.remove();
+}
+</script>
+
+<script id="nested_payload_and_closed_shadow_subtrees">
+{
+  const {host, root} = geometryHost();
+  const slot = document.createElement('slot');
+  root.appendChild(slot);
+  const first = document.createElement('div');
+  const nested = document.createElement('i');
+  nested.textContent = 'text';
+  const hidden = document.createElement('div');
+  hidden.style.display = 'none';
+  first.append(nested, document.createComment('counted'), hidden);
+  const shadowHost = document.createElement('div');
+  shadowHost.appendChild(document.createElement('div'));
+  const closed = shadowHost.attachShadow({mode: 'closed'});
+  const em = document.createElement('em');
+  const bold = document.createElement('b');
+  em.appendChild(bold);
+  closed.appendChild(em);
+  const last = document.createElement('div');
+  host.append(first, shadowHost, last);
+  testing.expectEqual([first, shadowHost, last], slot.assignedNodes());
+  // first contributes five nodes, including hidden/text/comment nodes.
+  // shadowHost contributes itself, em and b, excluding its unslotted child.
+  expectSlotPosition(slot, first, 5);
+  expectSlotPosition(slot, shadowHost, 30);
+  expectSlotPosition(slot, last, 45);
+  nested.appendChild(document.createElement('u'));
+  expectSlotPosition(slot, last, 50);
+  hidden.remove();
+  expectSlotPosition(slot, last, 45);
+  bold.appendChild(document.createElement('i'));
+  expectSlotPosition(slot, last, 50);
+  shadowHost.firstChild.slot = 'missing';
+  const innerSlot = document.createElement('slot');
+  closed.appendChild(innerSlot);
+  const innerPayload = document.createElement('span');
+  innerPayload.appendChild(document.createElement('i'));
+  shadowHost.appendChild(innerPayload);
+  testing.expectEqual([innerPayload], innerSlot.assignedNodes());
+  expectSlotPosition(slot, last, 65);
+  host.remove();
+}
+</script>
+
+<script id="shadow_attachment_replaces_light_prefix">
+{
+  const wrapper = document.createElement('div');
+  document.body.appendChild(wrapper);
+  const host = document.createElement('div');
+  const first = document.createElement('div');
+  first.appendChild(document.createElement('i'));
+  const last = document.createElement('div');
+  host.append(first, last);
+  const after = document.createElement('div');
+  wrapper.append(host, after);
+  expectSlotPosition(host, after, 20);
+  const closed = host.attachShadow({mode: 'closed'});
+  expectSlotPosition(host, after, 5);
+  const slot = document.createElement('slot');
+  closed.appendChild(slot);
+  testing.expectEqual([first, last], slot.assignedNodes());
+  testing.expectEqual(null, last.assignedSlot);
+  expectSlotPosition(slot, last, 15);
+  expectSlotPosition(host, after, 25);
+  wrapper.remove();
+}
+</script>
