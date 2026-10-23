@@ -2110,6 +2110,8 @@ pub const Request = struct {
         image,
         text_track,
         worker,
+        // navigator.sendBeacon
+        beacon,
 
         // Allowed Values: Document, Stylesheet, Image, Media, Font, Script,
         // TextTrack, XHR, Fetch, Prefetch, EventSource, WebSocket, Manifest,
@@ -2126,6 +2128,7 @@ pub const Request = struct {
                 .image => "Image",
                 .text_track => "TextTrack",
                 .worker => "Script",
+                .beacon => "Ping",
             };
         }
     };
@@ -2740,7 +2743,7 @@ pub const Transfer = struct {
         return switch (self.req.resource_type) {
             // The owner of a document request is the frame being navigated.
             .document => if (self.owner != null and self.owner.?.parent != null) "iframe" else "document",
-            .xhr, .fetch, .eventsource => "empty",
+            .xhr, .fetch, .eventsource, .beacon => "empty",
             .script => "script",
             .stylesheet => "style",
             .image => "image",
@@ -3492,6 +3495,7 @@ pub const Transfer = struct {
                 .eventsource, .worker => "other",
                 .image => "img",
                 .text_track => "track",
+                .beacon => "beacon",
             },
             .protocol = t.protocol,
             .start = t.start_time,

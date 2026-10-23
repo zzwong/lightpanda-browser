@@ -123,6 +123,8 @@ _files: ?*FileList = null,
 _selection_start: u32 = 0,
 _selection_end: u32 = 0,
 _selection_direction: Selection.SelectionDirection = .none,
+// A queued selectionchange not yet fired; later changes fold into it.
+_selectionchange_pending: bool = false,
 
 pub fn asElement(self: *Input) *Element {
     return Factory.protoOf(self).asElement();
@@ -481,6 +483,22 @@ pub fn suffersRangeUnderflow(self: *const Input) bool {
 
 pub fn suffersRangeOverflow(self: *const Input) bool {
     return numericRangeBreach(self, .overflow);
+}
+
+pub fn suffersStepMismatch(self: *const Input) bool {
+    const typ = self._input_type;
+    if (!hasNumericValue(typ)) return false;
+    const step = self.allowedValueStep() orelse return false;
+    const value = valueToNumber(typ, self.getValue()) orelse return false;
+    return offStep(value, self.stepBase(), step);
+}
+
+/// Whether value is off the ladder of steps from base. The tolerance grows with the
+/// magnitudes, so float error in a large value with a fractional step is not a mismatch.
+fn offStep(value: f64, base: f64, step: f64) bool {
+    const rungs = (value - base) / step;
+    const tolerance = @max(1e-9, 4 * std.math.floatEps(f64) * (@abs(value) + @abs(base)) / step);
+    return @abs(rungs - @round(rungs)) > tolerance;
 }
 
 fn numericRangeBreach(self: *const Input, comptime kind: enum { underflow, overflow }) bool {
@@ -950,7 +968,7 @@ fn stepBy(self: *Input, n: i32, frame: *Frame) !void {
     const base = self.stepBase();
     const rungs = (before - base) / step;
     const steps: f64 = @floatFromInt(n);
-    var value = if (@abs(rungs - @round(rungs)) > 1e-9)
+    var value = if (offStep(before, base, step))
         // Off the ladder: the snap to the next rung counts as the first step
         // (what browsers do; the spec text ignores n here).
         base + (if (n < 0) @floor(rungs) + steps + 1 else @ceil(rungs) + steps - 1) * step

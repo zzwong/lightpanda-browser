@@ -849,8 +849,8 @@ pub fn widthSizing(self: *StyleManager, el: *Element) WidthSizing {
     if (vis.box != .block_level or el.getTag().isReplacedOrControl()) {
         return .shrink;
     }
-    const flow = self.flow.ownProps(self.arena.allocator(), el, self.frame);
-    if (flow.absolutely_positioned or flow.floated) {
+    const flow = self.flowProps(el);
+    if (flow.position.outOfFlow() or flow.floated) {
         return .shrink;
     }
     const parent = self.boxParent(el) orelse return .fill;
@@ -889,8 +889,22 @@ pub fn isBlockLevel(self: *StyleManager, el: *Element) bool {
         .block_level, .table => {},
         .inline_level, .contents => return false,
     }
-    const flow = self.flow.ownProps(self.arena.allocator(), el, self.frame);
-    return flow.absolutely_positioned == false and flow.floated == false;
+    const flow = self.flowProps(el);
+    return flow.position.outOfFlow() == false and flow.floated == false;
+}
+
+/// Own property, not inherited.
+pub fn position(self: *StyleManager, el: *Element) Position {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .static;
+    return self.flowProps(el).position;
+}
+
+/// `position: fixed` on `el` or on a box above it.
+pub fn inFixedBox(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return false;
+    return self.flowProps(el).in_fixed;
 }
 
 /// Overflow along x is clipped or scrolled within the box, so it doesn't
@@ -981,6 +995,11 @@ fn visibilityProps(self: *StyleManager, el: *Element) Visibility.Computed {
 /// Callers must have run rebuildIfDirty, which resets the memo.
 fn geometryProps(self: *StyleManager, el: *Element) Geometry.Computed {
     return self.geometry.ownProps(self.arena.allocator(), el, self.frame);
+}
+
+/// Callers must have run rebuildIfDirty, which resets the memo.
+fn flowProps(self: *StyleManager, el: *Element) Flow.Computed {
+    return self.flow.inheritedProps(self.arena.allocator(), el, self.frame);
 }
 
 /// Taken before the arena resets, to presize the new containers.
@@ -1999,17 +2018,49 @@ const Text = struct {
     };
 };
 
-/// Whether a box is out of normal flow, which sizes it to its content.
+/// `inherit`, `unset` and `revert` are not handled, so they drop the
+/// declaration. `initial` is the initial value, static.
+pub const Position = enum(u3) {
+    static,
+    relative,
+    absolute,
+    fixed,
+    sticky,
+
+    // Null for an invalid value, which drops the declaration.
+    fn parse(value: []const u8) ?Position {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (std.ascii.eqlIgnoreCase(trimmed, "static") or std.ascii.eqlIgnoreCase(trimmed, "initial")) return .static;
+        if (std.ascii.eqlIgnoreCase(trimmed, "relative")) return .relative;
+        if (std.ascii.eqlIgnoreCase(trimmed, "absolute")) return .absolute;
+        if (std.ascii.eqlIgnoreCase(trimmed, "fixed")) return .fixed;
+        if (std.ascii.eqlIgnoreCase(trimmed, "sticky") or std.ascii.eqlIgnoreCase(trimmed, "-webkit-sticky")) return .sticky;
+        return null;
+    }
+
+    /// Out of flow, so the box sizes to its content. Sticky is not: it lays
+    /// out in flow and is only offset when painted.
+    fn outOfFlow(self: Position) bool {
+        return self == .absolute or self == .fixed;
+    }
+
+    /// The computed-value keyword, as getComputedStyle reports it.
+    pub fn keyword(self: Position) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Where a box sits: its position and whether it floats.
 const Flow = struct {
     const Declared = struct {
         const names = [_][]const u8{ "position", "float" };
 
-        absolutely_positioned: ?bool = null,
+        position: ?Position = null,
         floated: ?bool = null,
 
         fn apply(self: *Declared, name: []const u8, value: []const u8) void {
             if (std.ascii.eqlIgnoreCase(name, "position")) {
-                self.absolutely_positioned = std.ascii.eqlIgnoreCase(value, "absolute") or std.ascii.eqlIgnoreCase(value, "fixed");
+                self.position = Position.parse(value);
             } else if (std.ascii.eqlIgnoreCase(name, "float")) {
                 self.floated = std.ascii.eqlIgnoreCase(value, "left") or std.ascii.eqlIgnoreCase(value, "right") or
                     std.ascii.eqlIgnoreCase(value, "inline-start") or std.ascii.eqlIgnoreCase(value, "inline-end");
@@ -2017,16 +2068,29 @@ const Flow = struct {
         }
     };
 
-    const Computed = packed struct(u2) {
-        absolutely_positioned: bool = false,
+    pub const Cascaded = struct {
+        position: Position = .static,
         floated: bool = false,
+    };
+
+    const Computed = packed struct(u5) {
+        position: Position = .static,
+        floated: bool = false,
+        in_fixed: bool = false, // This element or an ancestor
+
+        fn resolve(own: Cascaded, parent: Computed) Computed {
+            return .{
+                .position = own.position,
+                .floated = own.floated,
+                .in_fixed = own.position == .fixed or parent.in_fixed,
+            };
+        }
     };
 };
 
 /// Paint-order inputs for the renderless hit tester. This is not a CSS renderer:
 /// geometry, floats, flex/grid order, top-layer and 3D painting remain approximate.
 const Stacking = struct {
-    const Position = enum { static, relative, absolute, fixed, sticky };
     const Declared = struct {
         const names = [_][]const u8{ "position", "z-index", "opacity", "transform", "isolation" };
         position: ?Position = null,
@@ -2038,10 +2102,7 @@ const Stacking = struct {
 
         fn apply(self: *Declared, name: []const u8, value: []const u8) void {
             if (std.ascii.eqlIgnoreCase(name, "position")) {
-                if (std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "unset")) self.position = .static;
-                inline for (@typeInfo(Position).@"enum".field_names) |field| {
-                    if (std.ascii.eqlIgnoreCase(value, field)) self.position = @field(Position, field);
-                }
+                self.position = if (std.ascii.eqlIgnoreCase(value, "unset")) .static else Position.parse(value);
             } else if (std.ascii.eqlIgnoreCase(name, "z-index")) {
                 if (std.ascii.eqlIgnoreCase(value, "auto") or std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "unset")) {
                     self.z_index = @as(?i32, null);
@@ -2539,6 +2600,29 @@ test "StyleManager: text-transform" {
     try testing.htmlRunner("css/text_transform.html", .{});
 }
 
+test "StyleManager: position parsing agrees with stacking and flow" {
+    for ([_][]const u8{ "sticky", "-webkit-sticky" }) |keyword| {
+        const position_value = Position.parse(keyword).?;
+        try std.testing.expectEqual(Position.sticky, position_value);
+        try std.testing.expectEqual(false, position_value.outOfFlow());
+        var stacking: Stacking.Declared = .{};
+        stacking.apply("position", keyword);
+        try std.testing.expectEqual(@as(?Position, position_value), stacking.position);
+        const computed: Stacking.Computed = .{ .position = stacking.position.? };
+        try std.testing.expectEqual(true, computed.positioned());
+        try std.testing.expectEqual(true, computed.createsContext());
+    }
+    try std.testing.expectEqual(true, Position.absolute.outOfFlow());
+    try std.testing.expectEqual(true, Position.fixed.outOfFlow());
+    var stacking: Stacking.Declared = .{ .position = .absolute };
+    stacking.apply("position", "unset");
+    try std.testing.expectEqual(@as(?Position, .static), stacking.position);
+}
+
+test "StyleManager: position" {
+    try testing.htmlRunner("css/position.html", .{});
+}
+
 test "StyleManager: text-transform without rules skips the memo" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
@@ -2786,8 +2870,8 @@ test "StyleManager: inlineDeclared: scan matches the parsed style object" {
         .{ .geometry = .{ .width = .{} } },
         .{ .visibility = .{ .display = .flex, .box = .block_level } },
         .{ .visibility = .{ .display = .grid, .box = .inline_level } },
-        .{ .geometry = .{ .width = .{ .unit = .content } }, .flow = .{ .absolutely_positioned = true, .floated = true }, .stacking = .{ .position = .absolute } },
-        .{ .geometry = .{ .width = .{ .unit = .content } }, .flow = .{ .absolutely_positioned = false, .floated = false }, .stacking = .{ .position = .relative } },
+        .{ .geometry = .{ .width = .{ .unit = .content } }, .flow = .{ .position = .absolute, .floated = true }, .stacking = .{ .position = .absolute } },
+        .{ .geometry = .{ .width = .{ .unit = .content } }, .flow = .{ .position = .relative, .floated = false }, .stacking = .{ .position = .relative } },
     };
 
     var i: usize = 0;
