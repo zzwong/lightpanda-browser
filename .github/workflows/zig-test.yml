@@ -1,10 +1,10 @@
-name: Fork native checks
+name: Fork macOS CLI qualification
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Full commit SHA in this fork to test
+        description: Full source commit SHA in this fork
         required: true
         type: string
 
@@ -12,32 +12,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-native-${{ inputs.source_ref }}
+  group: fork-macos-cli-${{ inputs.source_ref }}
   cancel-in-progress: false
 
-env:
-  LIGHTPANDA_DISABLE_TELEMETRY: true
-  TEST_JOBS: 2
-  CARGO_BUILD_JOBS: 2
-  CMAKE_BUILD_PARALLEL_LEVEL: 2
-
 jobs:
-  native:
-    name: native (${{ matrix.name }})
-    runs-on: ubuntu-latest
+  cli:
+    runs-on: macos-14
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: stock-v8
-            debug: false
-            library: libc_v8.a
-            tsan: false
-          - name: debug-v8-tsan
-            debug: true
-            library: libc_v8_debug.a
-            tsan: true
+    env:
+      LIGHTPANDA_DISABLE_TELEMETRY: true
+      CARGO_BUILD_JOBS: 1
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
     steps:
       - name: Validate source revision
         env:
@@ -48,12 +33,37 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Record tested revision
-        run: git rev-parse HEAD
+      - name: Record source inputs
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/source-commit.txt"
+          git diff --exit-code
+          git ls-files -z | xargs -0 shasum -a 256 > "$RUNNER_TEMP/source-before.sha256"
+          uname -am
       - uses: ./.github/actions/install
         with:
-          debug: ${{ matrix.debug }}
+          os: macos
+          arch: aarch64
       - name: Check formatting
         run: zig fmt --check ./
-      - name: Run native suite
-        run: zig build -j2 -Dprebuilt_v8_path=v8/${{ matrix.library }} -Dtsan=${{ matrix.tsan }} test
+      - name: Build debug CLI
+        run: zig build -j1 -Doptimize=debug -Dprebuilt_v8_path=v8/libc_v8.a install
+      - name: Verify source and package CLI
+        run: |
+          git diff --exit-code
+          git ls-files -z | xargs -0 shasum -a 256 > "$RUNNER_TEMP/source-after.sha256"
+          cmp "$RUNNER_TEMP/source-before.sha256" "$RUNNER_TEMP/source-after.sha256"
+          mkdir cli-artifact
+          cp zig-out/bin/lightpanda cli-artifact/lightpanda
+          cp "$RUNNER_TEMP/source-commit.txt" "$RUNNER_TEMP/source-before.sha256" "$RUNNER_TEMP/source-after.sha256" cli-artifact/
+          zig version > cli-artifact/zig-version.txt
+          uname -am > cli-artifact/platform.txt
+          cli-artifact/lightpanda version > cli-artifact/version.txt
+          cd cli-artifact
+          shasum -a 256 lightpanda > SHA256SUMS
+          cat version.txt SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lightpanda-macos-arm64-${{ inputs.source_ref }}
+          path: cli-artifact/
+          retention-days: 1
+          if-no-files-found: error
