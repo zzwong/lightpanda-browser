@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const Timezone = @import("Timezone.zig");
 
 const js = @import("js.zig");
 const bridge = @import("bridge.zig");
@@ -71,6 +72,9 @@ platform: *const Platform,
 
 // the global isolate
 isolate: js.Isolate,
+
+timezone_override: ?Timezone.Zone = null,
+timezone_cached: ?Timezone.Zone = null,
 
 contexts: std.ArrayList(*Context),
 
@@ -295,6 +299,9 @@ pub fn createWorkerContext(self: *Env, worker: *WorkerGlobalScope, params: Conte
 }
 
 fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context {
+    const timezone_scope = Timezone.Scope.enter(self);
+    defer timezone_scope.exit();
+
     const T = @TypeOf(global);
     const is_frame = T == *Frame;
 
@@ -518,6 +525,8 @@ pub fn runMicrotasks(self: *Env) void {
         var i: usize = 0;
         while (i < self.contexts.items.len) : (i += 1) {
             const ctx = self.contexts.items[i];
+            const timezone_scope = Timezone.Scope.enter(self);
+            defer timezone_scope.exit();
             // Reporting a rejection runs the page's listeners, which can queue
             // microtasks: checkpoint again, a bounded number of times.
             var rounds: u8 = 0;
@@ -663,6 +672,8 @@ pub fn msToNextTask(self: *Env) ?u64 {
 }
 
 pub fn pumpMessageLoop(self: *const Env) void {
+    const timezone_scope = Timezone.Scope.enter(@constCast(self));
+    defer timezone_scope.exit();
     var hs: v8.HandleScope = undefined;
     v8.v8__HandleScope__CONSTRUCT(&hs, self.isolate.handle);
     defer v8.v8__HandleScope__DESTRUCT(&hs);
@@ -688,12 +699,19 @@ pub fn waitForBackgroundTasks(self: *Env) void {
     const isolate = self.isolate.handle;
     const platform = self.platform.handle;
     while (v8.v8__Isolate__HasPendingBackgroundTasks(isolate)) {
-        _ = v8.v8__Platform__PumpMessageLoop(platform, isolate, true);
+        const pumped = blk: {
+            const timezone_scope = Timezone.Scope.enter(self);
+            defer timezone_scope.exit();
+            break :blk v8.v8__Platform__PumpMessageLoop(platform, isolate, false);
+        };
+        if (!pumped) lp.io.sleep(.fromMilliseconds(1), .awake) catch {};
         self.runMicrotasks();
     }
 }
 
 pub fn runIdleTasks(self: *const Env) void {
+    const timezone_scope = Timezone.Scope.enter(@constCast(self));
+    defer timezone_scope.exit();
     v8.v8__Platform__RunIdleTasks(self.platform.handle, self.isolate.handle, 1);
 }
 
@@ -903,6 +921,8 @@ pub fn cancelTerminate(self: *Env) void {
 /// aren't tracked in `contexts`. Guarded so a sighandler-thread terminate
 /// can't land mid-checkpoint.
 pub fn performIsolateMicrotasks(self: *Env) void {
+    const timezone_scope = Timezone.Scope.enter(self);
+    defer timezone_scope.exit();
     self.terminate_mutex.lockUncancelable(lp.io);
     defer self.terminate_mutex.unlock(lp.io);
     if (self.terminatePending()) return;

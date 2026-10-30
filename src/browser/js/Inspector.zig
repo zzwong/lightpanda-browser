@@ -19,6 +19,8 @@
 const std = @import("std");
 const js = @import("js.zig");
 const v8 = js.v8;
+const Timezone = @import("Timezone.zig");
+const Env = @import("Env.zig");
 
 const TaggedOpaque = @import("TaggedOpaque.zig");
 
@@ -189,12 +191,14 @@ pub const Session = struct {
     handle: *v8.InspectorSession,
     channel: *v8.InspectorChannelImpl,
 
+    env: *Env,
+
     // callbacks
     ctx: *anyopaque,
     onNotif: *const fn (ctx: *anyopaque, msg: []const u8) void,
     onResp: *const fn (ctx: *anyopaque, call_id: u32, msg: []const u8) void,
 
-    pub fn init(self: *Session, inspector: *Inspector, ctx: anytype) void {
+    pub fn init(self: *Session, inspector: *Inspector, env: *Env, ctx: anytype) void {
         const Container = @typeInfo(@TypeOf(ctx)).pointer.child;
 
         const channel = v8.v8_inspector__Channel__IMPL__CREATE(inspector.isolate);
@@ -211,6 +215,7 @@ pub const Session = struct {
             .handle = handle,
             .channel = channel,
             .inspector = inspector,
+            .env = env,
             .onResp = Container.onInspectorResponse,
             .onNotif = Container.onInspectorEvent,
         };
@@ -234,6 +239,8 @@ pub const Session = struct {
     fn dropNotification(_: *anyopaque, _: []const u8) void {}
 
     pub fn send(self: *const Session, msg: []const u8) void {
+        const timezone_scope = Timezone.Scope.enter(self.env);
+        defer timezone_scope.exit();
         const isolate = self.inspector.isolate;
         var hs: v8.HandleScope = undefined;
         v8.v8__HandleScope__CONSTRUCT(&hs, isolate);

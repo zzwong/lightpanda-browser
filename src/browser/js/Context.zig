@@ -31,6 +31,7 @@ const Env = @import("Env.zig");
 const Origin = @import("Origin.zig");
 const Scheduler = @import("Scheduler.zig");
 const Execution = @import("Execution.zig");
+const Timezone = @import("Timezone.zig");
 const WasmStreaming = @import("WasmStreaming.zig");
 
 const v8 = js.v8;
@@ -321,6 +322,7 @@ pub fn addIdentity(self: *Context, ptr: usize) !IdentityResult {
 // Any operation on the context have to be made from a local.
 pub fn localScope(self: *Context, ls: *js.Local.Scope) void {
     const isolate = self.isolate;
+    ls.timezone_scope = Timezone.Scope.enter(self.env);
     js.HandleScope.init(&ls.handle_scope, isolate);
 
     const local_v8_context: *const v8.Context = @ptrCast(v8.v8__Global__Get(&self.handle, isolate.handle));
@@ -1237,6 +1239,7 @@ test "Context: terminated async module completion does not re-enter V8" {
 //    defer entered.exit();
 pub fn enter(self: *Context, hs: *js.HandleScope) Entered {
     const isolate = self.isolate;
+    const timezone_scope = Timezone.Scope.enter(self.env);
     js.HandleScope.init(hs, isolate);
 
     const original = self.global.getJs();
@@ -1250,6 +1253,7 @@ pub fn enter(self: *Context, hs: *js.HandleScope) Entered {
         .handle_scope = hs,
         .global = self.global,
         .page_scope = self.page.logScope(),
+        .timezone_scope = timezone_scope,
     };
 }
 
@@ -1265,12 +1269,14 @@ const Entered = struct {
     global: lp.GlobalScope,
 
     page_scope: log.PageScope,
+    timezone_scope: Timezone.Scope,
 
     pub fn exit(self: Entered) void {
         self.page_scope.exit();
         self.global.setJs(self.original);
         v8.v8__Context__Exit(self.handle);
         self.handle_scope.deinit();
+        self.timezone_scope.exit();
     }
 };
 
