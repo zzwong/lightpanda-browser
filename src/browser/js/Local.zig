@@ -1693,11 +1693,13 @@ pub const Scope = struct {
     local: Local,
     handle_scope: js.HandleScope,
     page_scope: log.PageScope,
+    timezone_scope: @import("Timezone.zig").Scope,
 
     pub fn deinit(self: *Scope) void {
         self.page_scope.exit();
         v8.v8__Context__Exit(self.local.handle);
         self.handle_scope.deinit();
+        self.timezone_scope.exit();
     }
 
     pub fn toLocal(self: *Scope, global: anytype) ToLocalReturnType(@TypeOf(global)) {

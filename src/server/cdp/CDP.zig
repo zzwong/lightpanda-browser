@@ -1284,7 +1284,7 @@ pub const BrowserContext = struct {
             .bc = self,
             .inspector_session = undefined,
         };
-        attached.inspector_session.init(self.inspector(), attached);
+        attached.inspector_session.init(self.inspector(), &self.cdp.browser.env, attached);
         errdefer attached.inspector_session.deinit();
 
         try self.attached_sessions.put(allocator, attached.id, attached);
