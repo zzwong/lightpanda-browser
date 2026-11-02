@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<meta name=lp-mode content=test>
+<script src="../testing.js"></script>
+<link rel="preload stylesheet" href="/styles/visibility.css" as="style">
+<div id="probe" class="ext-hide">Hidden by the combined-rel stylesheet</div>
+
+<script id="parser_stylesheet_token">
+  testing.expectEqual(1, document.styleSheets.length);
+  testing.expectEqual(testing.ORIGIN + '/styles/visibility.css', document.styleSheets[0].href);
+  testing.expectEqual('none', getComputedStyle(document.getElementById('probe')).display);
+</script>
+
+<script id="stylesheet_token_boundaries">
+{
+  const before = document.styleSheets.length;
+  for (const rel of ['notstylesheet', 'stylesheet-extra', 'preload,stylesheet', 'preload\vstylesheet', 'preload\u00a0stylesheet', 'preload']) {
+    const link = document.createElement('link');
+    link.rel = rel;
+    link.as = 'style';
+    link.href = '/styles/visibility2.css';
+    document.head.appendChild(link);
+    testing.expectEqual(before, document.styleSheets.length);
+    link.remove();
+  }
+}
+</script>
+
+<script id="dynamic_stylesheet_tokens" type=module>
+  const state = await testing.async();
+  const observed = [];
+  const rels = ['stylesheet', 'preload stylesheet', 'stylesheet preload', 'StYlEsHeEt', ' stylesheet ', 'stylesheet stylesheet',
+    ...[' ', '\t', '\n', '\r', '\f'].map(space => 'help' + space + 'stylesheet')];
+  for (const rel of rels) {
+    const link = document.createElement('link');
+    link.rel = rel;
+    link.as = 'style';
+    link.href = '/styles/visibility2.css';
+    const events = [];
+    const outcome = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve('timeout'), 500);
+      for (const name of ['load', 'error']) link.addEventListener(name, () => {
+        clearTimeout(timer);
+        events.push(name);
+        resolve(name);
+      }, { once: true });
+      document.head.appendChild(link);
+      events.push('appended');
+      queueMicrotask(() => events.push('microtask'));
+    });
+    const sheets = Array.from(document.styleSheets).filter(sheet => sheet.ownerNode === link);
+    observed.push({ outcome, events, count: sheets.length, selector: sheets[0]?.cssRules[0]?.selectorText });
+    link.remove();
+  }
+  state.resolve();
+  await state.done(() => {
+    for (const result of observed) {
+      testing.expectEqual('load', result.outcome);
+      testing.expectEqual(['appended', 'microtask', 'load'], result.events);
+      testing.expectEqual(1, result.count);
+      testing.expectEqual('.ext-hide-2', result.selector);
+    }
+  });
+</script>
+
+<script id="rel_list_and_href_updates" type=module>
+  const state = await testing.async();
+  const link = document.createElement('link');
+  link.rel = 'help';
+  link.href = '/styles/visibility.css';
+  document.head.appendChild(link);
+  const ownedSheets = () => Array.from(document.styleSheets).filter(sheet => sheet.ownerNode === link);
+  const before = ownedSheets().length;
+  const mutate = action => new Promise(resolve => {
+    const timer = setTimeout(() => resolve('timeout'), 500);
+    const finish = event => {
+      clearTimeout(timer);
+      link.removeEventListener('load', finish);
+      link.removeEventListener('error', finish);
+      resolve(event.type);
+    };
+    link.addEventListener('load', finish);
+    link.addEventListener('error', finish);
+    action();
+  });
+  const first = await mutate(() => link.relList.add('stylesheet'));
+  const sheet = ownedSheets()[0];
+  const firstSelector = sheet?.cssRules[0]?.selectorText;
+  const second = await mutate(() => { link.href = '/styles/visibility2.css'; });
+  const secondSheets = ownedSheets();
+  const selector = secondSheets[0]?.cssRules[0]?.selectorText;
+  link.remove();
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(0, before);
+    testing.expectEqual('load', first);
+    testing.expectEqual('.ext-hide', firstSelector);
+    testing.expectEqual('load', second);
+    testing.expectEqual(1, secondSheets.length);
+    testing.expectEqual('.ext-hide-2', selector);
+  });
+</script>
+
+<script id="combined_stylesheet_error" type=module>
+  const state = await testing.async();
+  const link = document.createElement('link');
+  link.rel = 'preload stylesheet';
+  link.as = 'style';
+  link.href = '/styles/404.css';
+  const outcome = await new Promise(resolve => {
+    const timer = setTimeout(() => resolve('timeout'), 500);
+    for (const name of ['load', 'error']) link.addEventListener(name, () => {
+      clearTimeout(timer);
+      resolve(name);
+    });
+    document.head.appendChild(link);
+  });
+  link.remove();
+  state.resolve();
+  await state.done(() => testing.expectEqual('error', outcome));
+</script>
