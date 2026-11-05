@@ -243,12 +243,13 @@ pub const LoadResources = packed struct(u6) {
     none: bool = false,
 };
 
-pub const ExperimentalFeatures = packed struct(u2) {
+pub const ExperimentalFeatures = packed struct(u3) {
     cors: bool = false, // ignored, kept only for backward compatibility.
     serviceworker: bool = false,
+    privatecache: bool = false,
 };
 
-pub const DisabledFeatures = packed struct(u1) {
+const DisabledFeatures = packed struct(u1) {
     cors: bool = false,
 };
 
@@ -259,7 +260,7 @@ const CommonOptions = .{
     .{ .name = "cors_store_entry_limit", .type = ?u32, .default = 1000 },
     .{ .name = "proxy_bearer_token", .type = ?[:0]const u8 },
     .{ .name = "http_proxy", .type = ?[:0]const u8 },
-    .{ .name = "http_max_concurrent", .type = ?u8 },
+    .{ .name = "http_max_concurrent", .type = ?u16 },
     .{ .name = "http_max_host_open", .type = ?u8 },
     .{ .name = "http_nav_delay", .type = ?u32 },
     .{ .name = "http_nav_burst", .type = ?u32 },
@@ -356,7 +357,7 @@ pub const AiProvider = std.meta.Tag(zenai.provider.Client);
 /// in `Agent.init` (explicit flag > remembered > mode default), so there is
 /// no Config-level accessor like `agentVerbosity`.
 pub const Effort = zenai.provider.Effort;
-pub const SearchEngine = @import("browser/tools.zig").SearchEngine;
+const SearchEngine = @import("browser/tools/search.zig").Engine;
 
 /// Controls how chatty `agent` mode is on stderr.
 pub const AgentVerbosity = enum {
@@ -513,7 +514,6 @@ pub const Commands = cli.Builder(.{
 const RunMode = Commands.Enum;
 pub const Mode = Commands.Union;
 pub const Agent = @FieldType(Mode, "agent");
-const Serve = @FieldType(Mode, "serve");
 
 mode: Mode,
 // The command as typed. Mirrors `mode`, except `run` normalizes to `.agent`
@@ -683,9 +683,10 @@ fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
     };
 }
 
-pub fn httpMaxConcurrent(self: *const Config) u8 {
+pub fn httpMaxConcurrent(self: *const Config) u16 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_concurrent orelse 40,
+        .serve => |opts| opts.http_max_concurrent orelse std.math.clamp(opts.cdp_max_connections *| 8, 40, 256),
+        inline .fetch, .mcp, .agent => |opts| opts.http_max_concurrent orelse 40,
         else => unreachable,
     };
 }
@@ -1050,6 +1051,7 @@ pub const WaitUntil = enum {
     domcontentloaded,
     networkalmostidle,
     networkidle,
+    settled,
     done,
 };
 
@@ -1479,6 +1481,27 @@ test "Config: parseArgs --http-session-timeout" {
         const proc_args: std.process.Args = .{ .vector = &argv };
         const config = try parseArgs(arena.allocator(), proc_args);
         try std.testing.expectEqual(null, config.httpSessionTimeout());
+    }
+}
+
+test "Config: httpMaxConcurrent default scales with --cdp-max-connections on serve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cases = [_]struct { argv: []const [*:0]const u8, expected: u16 }{
+        .{ .argv = &.{ "lightpanda", "serve" }, .expected = 128 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "2" }, .expected = 40 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "100" }, .expected = 256 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "65535" }, .expected = 256 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "100", "--http-max-concurrent", "1000" }, .expected = 1000 },
+        .{ .argv = &.{ "lightpanda", "serve", "--http-max-concurrent", "10" }, .expected = 10 },
+        .{ .argv = &.{ "lightpanda", "fetch", "https://example.com" }, .expected = 40 },
+        .{ .argv = &.{ "lightpanda", "mcp" }, .expected = 40 },
+    };
+    for (cases) |case| {
+        const proc_args: std.process.Args = .{ .vector = case.argv };
+        const config = try parseArgs(arena.allocator(), proc_args);
+        try std.testing.expectEqual(case.expected, config.httpMaxConcurrent());
     }
 }
 

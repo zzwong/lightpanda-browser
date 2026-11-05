@@ -122,8 +122,21 @@
       return;
     }
 
+    if (diverging) {
+      _diverged('expected error but no error received');
+      return;
+    }
     console.error(`expected error but no error received\n`);
     throw new Error('no error');
+  }
+
+  // Resolves once observer notifications queued so far have been delivered:
+  // WPT's waitForNotification, two frames then a task. Page load isn't
+  // ordered against them.
+  function nextFrame() {
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve)));
+    });
   }
 
   function onload(cb) {
@@ -337,11 +350,19 @@
     beginBrowserLog: beginBrowserLog,
     endBrowserLog: endBrowserLog,
     onload: onload,
+    nextFrame: nextFrame,
     IS_TEST_RUNNER: IS_TEST_RUNNER,
     HOST: '127.0.0.1',
     ORIGIN: 'http://127.0.0.1:9582',
     BASE_URL: 'http://127.0.0.1:9582/src/browser/tests/',
+    skipAsync: skipAsync
   };
+
+  async function skipAsync() {
+    const state = await async();
+    state.resolve();
+    state.done(() => { expectTrue(true); });
+  }
 
   if (IS_TEST_RUNNER === false) {
     // The page is running in a different browser. Probably a developer making sure

@@ -33,6 +33,14 @@ const TestHTTPServer = @import("TestHTTPServer.zig");
 var sse_flag = std.atomic.Value(bool).init(false);
 var sse_reconnect_hits = std.atomic.Value(usize).init(0);
 
+// /auth/proxy/*: a proxy retry carries nothing the origin can see, so this
+// tells the challenge (first request) from the retry (second).
+var auth_proxy_challenged = std.atomic.Value(bool).init(false);
+
+/// A `/src/browser/tests/` load with `held=1` in its query waits while this is
+/// set, so a test can keep a load in flight exactly as long as it needs.
+pub var hold_loads = std.atomic.Value(bool).init(false);
+
 // /serve-count/ counters; only ever touched from the test HTTP server thread.
 var serve_counts = [_]struct { name: []const u8, count: u32 = 0 }{
     .{ .name = "defer" },
@@ -42,6 +50,9 @@ var serve_counts = [_]struct { name: []const u8, count: u32 = 0 }{
     .{ .name = "prescan_defer" },
     .{ .name = "prescan_module" },
 };
+
+// /cache/set-cookie responses sent; only ever touched from the test HTTP server thread.
+var cache_set_cookie_count: u32 = 0;
 
 // Written byte for byte by /raw/<name>, so the encodedDataLength tests know
 // how many header and body bytes crossed the wire. A request carrying
@@ -135,14 +146,33 @@ pub fn handle(req: *std.http.Server.Request) !void {
         // A test process gets its own server, so this state starts fresh for
         // it. A long-lived `zig build test-server` is reset per fixture instead.
         for (&serve_counts) |*sc| sc.count = 0;
+        cache_set_cookie_count = 0;
         sse_flag.store(false, .release);
         sse_reconnect_hits.store(0, .release);
+        auth_proxy_challenged.store(false, .release);
         {
             beacon_mutex.lockUncancelable(lp.io);
             defer beacon_mutex.unlock(lp.io);
             beacon_record_count = 0;
         }
         return req.respond("", .{});
+    }
+
+    if (std.mem.eql(u8, path, "/cache/set-cookie")) {
+        // Heuristically cacheable (Last-Modified). The body and the cookie
+        // carry the count, so a fixture can tell a cache hit from the network.
+        cache_set_cookie_count += 1;
+        var body_buf: [32]u8 = undefined;
+        const body = try std.mem.print(&body_buf, "served {d}", .{cache_set_cookie_count});
+        var cookie_buf: [64]u8 = undefined;
+        const cookie = try std.mem.print(&cookie_buf, "lp_cache_test={d}; Path=/", .{cache_set_cookie_count});
+        return req.respond(body, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "Last-Modified", .value = "Mon, 01 Jan 2024 00:00:00 GMT" },
+                .{ .name = "Set-Cookie", .value = cookie },
+            },
+        });
     }
 
     if (std.mem.eql(u8, path, "/")) {
@@ -215,6 +245,10 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/v1/systemone")) {
+        return systemOne(req, req_allocator);
+    }
+
     if (std.mem.eql(u8, path, "/xhr/redirect")) {
         return req.respond("", .{
             .status = .found,
@@ -260,6 +294,15 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/redirect-bad-port")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "http://127.0.0.1:22/" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/redirect-cross-origin-x-hop")) {
         return req.respond("", .{
             .status = .found,
@@ -282,6 +325,27 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
+    // The way back from /redirect-cross-origin/: to the same path on 127.0.0.1.
+    if (std.mem.startsWith(u8, path, "/redirect-127/")) {
+        var location_buf: [1024]u8 = undefined;
+        const location = try std.mem.print(&location_buf, "http://127.0.0.1:9582/{s}", .{path["/redirect-127/".len..]});
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = location },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/set-cookie-lax")) {
+        return req.respond("<p>lax", .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html" },
+                .{ .name = "Set-Cookie", .value = "xsite_redirect_lax=1; SameSite=Lax" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/echo-x-hop")) {
         var it = req.iterateHeaders();
         var value: []const u8 = "NONE";
@@ -294,6 +358,26 @@ pub fn handle(req: *std.http.Server.Request) !void {
         return req.respond(value, .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/markdown-negotiated")) {
+        var it = req.iterateHeaders();
+        while (it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "accept")) continue;
+            if (std.mem.indexOf(u8, header.value, "text/markdown") == null) break;
+            return req.respond("# Negotiated\n\nSent as *markdown*.\n", .{
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/markdown; charset=utf-8" },
+                    .{ .name = "Vary", .value = "Accept" },
+                },
+            });
+        }
+        return req.respond("<!DOCTYPE html><h1>Negotiated</h1><p>Sent as HTML.</p>", .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+                .{ .name = "Vary", .value = "Accept" },
             },
         });
     }
@@ -444,6 +528,50 @@ pub fn handle(req: *std.http.Server.Request) !void {
                 .{ .name = "WWW-Authenticate", .value = "Basic realm=\"test\"" },
             },
         });
+    }
+
+    // /auth/{server,proxy}/{same,cross}: challenges the first request (401
+    // or 407), then redirects the retry to /echo-authorization on this host
+    // (same) or the other loopback host (cross).
+    if (std.mem.startsWith(u8, path, "/auth/")) {
+        const rest = path["/auth/".len..];
+        const proxy = std.mem.startsWith(u8, rest, "proxy/");
+        const challenge = if (proxy) !auth_proxy_challenged.swap(true, .acq_rel) else blk: {
+            var it = req.iterateHeaders();
+            while (it.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "authorization")) break :blk false;
+            }
+            break :blk true;
+        };
+        if (challenge) {
+            return req.respond("No", .{
+                .status = if (proxy) .proxy_auth_required else .unauthorized,
+                .extra_headers = &.{
+                    .{ .name = if (proxy) "Proxy-Authenticate" else "WWW-Authenticate", .value = "Basic realm=\"test\"" },
+                },
+            });
+        }
+        if (proxy) auth_proxy_challenged.store(false, .release);
+        const host = if (std.mem.endsWith(u8, rest, "/cross")) "localhost" else "127.0.0.1";
+        var location_buf: [64]u8 = undefined;
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = try std.mem.print(&location_buf, "http://{s}:9582/echo-authorization", .{host}) },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/echo-authorization")) {
+        var it = req.iterateHeaders();
+        var value: []const u8 = "NONE";
+        while (it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
+                value = header.value;
+                break;
+            }
+        }
+        return req.respond(value, .{});
     }
 
     if (std.mem.eql(u8, path, "/xhr/500")) {
@@ -714,16 +842,13 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
-    // Bodies are non-empty so that libcurl always reaches the write callback,
-    // which is where a partial request decides whether to drain or abort.
-    // ok.png takes the abort branch, small.png the drain branch; both must
-    // behave identically as far as the DOM is concerned.
-    if (std.mem.eql(u8, path, "/images/ok.png")) {
-        // > HttpClient.Request.PARTIAL_DRAIN_MAX. The synthetic PNG
-        // header advertises 1000 x 750 pixels; no bitmap is decoded.
+    if (std.mem.startsWith(u8, path, "/images/ok.png")) {
+        // Padded past HttpClient.Request.PARTIAL_DRAIN_MAX. Decoders ignore
+        // what follows the PNG's IEND chunk.
+        const png = @embedFile("browser/tests/fixtures/images/1000x750.png");
         const body = try req_allocator.alloc(u8, 16 * 1024 + 1);
         @memset(body, 'x');
-        @memcpy(body[0..24], "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x03\xe8\x00\x00\x02\xee");
+        @memcpy(body[0..png.len], png);
         return req.respond(body, .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "image/png" },
@@ -734,10 +859,7 @@ pub fn handle(req: *std.http.Server.Request) !void {
     // startsWith, not eql: a caller can append a query string to get distinct
     // URLs (and so distinct transfers) off this one route.
     if (std.mem.startsWith(u8, path, "/images/small.png")) {
-        const body = try req_allocator.alloc(u8, 1024);
-        @memset(body, 'x');
-        @memcpy(body[0..24], "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x01\x40\x00\x00\x00\xf0");
-        return req.respond(body, .{
+        return req.respond(@embedFile("browser/tests/fixtures/images/320x240.png"), .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "image/png" },
             },
@@ -745,8 +867,7 @@ pub fn handle(req: *std.http.Server.Request) !void {
     }
 
     if (std.mem.eql(u8, path, "/images/photo.jpg")) {
-        const body = "\xff\xd8\xff\xe1\x00\x04\x00\x00\xff\xc0\x00\x0b\x08\x02\xee\x03\xe8\x01\x01\x11\x00";
-        return req.respond(body, .{
+        return req.respond(@embedFile("browser/tests/fixtures/images/1000x750.jpg"), .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "image/jpeg" },
             },
@@ -769,7 +890,7 @@ pub fn handle(req: *std.http.Server.Request) !void {
         return res.end();
     }
 
-    if (std.mem.eql(u8, path, "/images/404.png")) {
+    if (std.mem.startsWith(u8, path, "/images/404.png")) {
         return req.respond("not here", .{
             .status = .not_found,
             .extra_headers = &.{
@@ -919,7 +1040,8 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
-    if (std.mem.eql(u8, path, "/echo_headers")) {
+    // The /download_tool copy sits under that fixture's cookie scope.
+    if (std.mem.eql(u8, path, "/echo_headers") or std.mem.eql(u8, path, "/download_tool/echo_headers")) {
         if (req.head.method == .OPTIONS) {
             return req.respond("", .{
                 .extra_headers = &.{
@@ -943,6 +1065,32 @@ pub fn handle(req: *std.http.Server.Request) !void {
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
                 .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/cors_expose_headers_listed")) {
+        // Cross-origin response listing X-Secret in Access-Control-Expose-Headers
+        // (it must stay visible), alongside X-Hidden, which isn't listed
+        // (it must stay hidden even though the response is otherwise allowed).
+        return req.respond("", .{
+            .extra_headers = &.{
+                .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+                .{ .name = "Access-Control-Expose-Headers", .value = "X-Secret" },
+                .{ .name = "X-Secret", .value = "s3cr3t" },
+                .{ .name = "X-Hidden", .value = "shh" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/cors_expose_headers_unlisted")) {
+        // Same custom header, but not listed in Access-Control-Expose-Headers:
+        // it must be hidden from a cross-origin caller, even though the
+        // response allows the origin.
+        return req.respond("", .{
+            .extra_headers = &.{
+                .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+                .{ .name = "X-Secret", .value = "s3cr3t" },
             },
         });
     }
@@ -973,6 +1121,36 @@ pub fn handle(req: *std.http.Server.Request) !void {
             .status = .found,
             .extra_headers = &.{
                 .{ .name = "Location", .value = "http://localhost:9582/echo_headers" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect_a_b_a")) {
+        // 302 to the localhost alias, which itself 302s back to 127.0.0.1 —
+        // an A -> B -> A chain. Even though the final URL is back on the
+        // requesting origin, the hop through B must leave the response
+        // permanently CORS-tainted (response.type === 'cors' in fetch,
+        // cross-origin header stripping in XHR), not reset to "basic".
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "http://localhost:9582/redirect_b_a" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect_b_a")) {
+        // Second hop of the A -> B -> A chain: back to the original origin,
+        // landing on an endpoint that exposes one header and withholds
+        // another. If the chain were wrongly reset to "basic" on return to
+        // A, the hidden header would wrongly become visible. Once
+        // cross-origin-tainted, every response in the chain — including this
+        // redirect itself — must pass the CORS check, so it needs ACAO.
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+                .{ .name = "Location", .value = "http://127.0.0.1:9582/cors_expose_headers_listed" },
             },
         });
     }
@@ -1021,7 +1199,42 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/download/missing.csv")) {
+        // A download the server fails: its body must not be written.
+        return req.respond("not found", .{
+            .status = .not_found,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "Content-Disposition", .value = "attachment; filename=\"missing.csv\"" },
+            },
+        });
+    }
+
+    // Fixture for the browser `download` tool tests. Its cookie is scoped to
+    // this path prefix, so it can't reach the handlers other tests on the
+    // shared session rely on.
+    if (std.mem.eql(u8, path, "/download_tool/no_content")) {
+        return req.respond("", .{ .status = .no_content });
+    }
+
+    if (std.mem.eql(u8, path, "/download_tool/redirect")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Set-Cookie", .value = "lp_redirect=1; Path=/download_tool" },
+                .{ .name = "Location", .value = "/download_tool/echo_headers" },
+            },
+        });
+    }
+
     if (std.mem.startsWith(u8, path, "/src/browser/tests/")) {
+        if (std.mem.find(u8, path, "held=1") != null) {
+            // Capped, so a test that fails before releasing can't hang the suite.
+            var waited: usize = 0;
+            while (hold_loads.load(.acquire) and waited < 10_000) : (waited += 5) {
+                lp.io.sleep(.fromMilliseconds(5), .awake) catch {};
+            }
+        }
         if (std.mem.find(u8, path, "delay_ms=")) |pos| {
             const digits_start = pos + "delay_ms=".len;
             var end = digits_start;
@@ -1042,4 +1255,225 @@ pub fn handle(req: *std.http.Server.Request) !void {
     }
 
     return req.respond("not found", .{ .status = .not_found });
+}
+
+/// A stand-in for TypeSafe System One. `classify` asserts exact answers for
+/// names it knows, so those come from a fixed body that deliberately leaves
+/// most presets unanswered. `acceptCookies` and `login` cannot: their choices
+/// are keyed by registry node ids, which differ per run, so an answer has to
+/// be built from the request that asked.
+fn systemOne(req: *std.http.Server.Request, arena: std.mem.Allocator) !void {
+    const classify_answers =
+        \\{
+        \\  "model": "jev-latest",
+        \\  "answers": {
+        \\    "isBlocked": {"type": "noul", "noul": 0.95},
+        \\    "isCaptcha": {"type": "noul", "noul": 0.05},
+        \\    "is_blocked": {"type": "noul", "noul": 0.95},
+        \\    "__category": {"type": "choice", "choice": "product", "probabilities": {"product": 0.95, "catalog": 0.05}, "confidence": 0.95},
+        \\    "page_type": {"type": "choice", "choice": "product", "probabilities": {"product": 0.9, "catalog": 0.1}, "confidence": 0.9},
+        \\    "completeness": {"type": "score", "score": 1.8, "legend": {"0": "empty", "1": "partial", "2": "full"}, "probabilities": {"0": 0.05, "1": 0.1, "2": 0.85}, "confidence": 0.85}
+        \\  }
+        \\}
+    ;
+
+    const no_verify = bearer(req, no_verify_key);
+    // Long enough that a caller blocking on the answer visibly stops its own
+    // page, and short enough not to slow the suite down.
+    if (bearer(req, slow_key)) lp.io.sleep(.fromMilliseconds(400), .awake) catch {};
+
+    var body_buf: [64 * 1024]u8 = undefined;
+    const body = if (req.head.method.requestHasBody())
+        try req.readerExpectNone(&body_buf).allocRemaining(arena, .limited(body_buf.len))
+    else
+        "";
+
+    const answers = fixed: {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
+            break :fixed classify_answers;
+        const questions = switch (parsed.object.get("questions") orelse .null) {
+            .object => |o| o,
+            else => break :fixed classify_answers,
+        };
+        break :fixed switch (requestKind(questions)) {
+            .other => classify_answers,
+            .deciding => try answerAsked(arena, questions, true, std.ascii.findIgnoreCase(body, banner_label) != null),
+            .verifying => if (no_verify)
+                return req.respond("the verification service is down", .{
+                    .status = .internal_server_error,
+                    .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+                })
+            else
+                try answerAsked(arena, questions, false, std.ascii.findIgnoreCase(body, banner_label) != null),
+        };
+    };
+    return req.respond(answers, .{
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+}
+
+/// What a request is: the one that decides, which offers page elements to
+/// choose between; the verification re-read that follows it, which asks the
+/// wall questions alone; or neither, which is `classify` asking something else.
+fn requestKind(asked: std.json.ObjectMap) enum { deciding, verifying, other } {
+    var all_walls = asked.count() > 0;
+    var it = asked.iterator();
+    while (it.next()) |entry| {
+        if (hintFor(entry.key_ptr.*) != null) return .deciding;
+        if (!isWall(entry.key_ptr.*)) all_walls = false;
+    }
+    return if (all_walls) .verifying else .other;
+}
+
+/// An answer per question asked. `deciding` is the request that offers
+/// elements; by the time the re-read asks, the fixture has taken the banner
+/// away or signed in, so its wall questions answer no.
+fn answerAsked(arena: std.mem.Allocator, asked: std.json.ObjectMap, deciding: bool, banner_in_state: bool) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+
+    try jw.beginObject();
+    try jw.objectField("model");
+    try jw.write("jev-latest");
+    try jw.objectField("answers");
+    try jw.beginObject();
+
+    // The mock sees the questions, not the page: one that offered no field
+    // looking like a password is one that asks for it on a later step.
+    const later_step = pickFor(arena, asked, lp.tools.login.password_key) == null;
+
+    var it = asked.iterator();
+    while (it.next()) |entry| {
+        const question = switch (entry.value_ptr.*) {
+            .object => |o| o,
+            else => continue,
+        };
+        const kind = switch (question.get("type") orelse .null) {
+            .string => |s| s,
+            else => continue,
+        };
+        const key = entry.key_ptr.*;
+        try jw.objectField(key);
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(kind);
+        if (std.mem.eql(u8, kind, "choice")) {
+            const options: std.json.ObjectMap = switch (question.get("criteria") orelse .null) {
+                .object => |o| o,
+                else => .empty,
+            };
+            const pick = pickOption(arena, options, hintFor(key)) orelse lp.tools.choose.none_key;
+            try jw.objectField("choice");
+            try jw.write(pick);
+            // Rejected unless the probabilities cover exactly the options
+            // offered and sum to 1, with the choice as their argmax.
+            const n = options.count();
+            const chosen: f64 = if (n < 2) 1 else 0.7;
+            const even: f64 = if (n < 2) 0 else (1 - chosen) / @as(f64, @floatFromInt(n - 1));
+            // Where a candidate was chosen, `none` keeps a token share and the
+            // others outrank it, as a model's answer would.
+            const spread = n > 2 and !std.mem.eql(u8, pick, lp.tools.choose.none_key);
+            const none_share: f64 = if (spread) 0.05 else even;
+            const share: f64 = if (spread) (1 - chosen - none_share) / @as(f64, @floatFromInt(n - 2)) else even;
+            try jw.objectField("probabilities");
+            try jw.beginObject();
+            var option = options.iterator();
+            while (option.next()) |o| {
+                const option_key = o.key_ptr.*;
+                try jw.objectField(option_key);
+                try jw.write(if (std.mem.eql(u8, option_key, pick))
+                    chosen
+                else if (std.mem.eql(u8, option_key, lp.tools.choose.none_key))
+                    none_share
+                else
+                    share);
+            }
+            try jw.endObject();
+            try jw.objectField("confidence");
+            try jw.write(0.9);
+        } else {
+            const noul: f64 = if (yesTo(key, deciding, later_step, banner_in_state)) 0.95 else 0.05;
+            try jw.objectField(kind);
+            try jw.write(noul);
+        }
+        try jw.endObject();
+    }
+
+    try jw.endObject();
+    try jw.endObject();
+    return out.written();
+}
+
+/// The consent fixtures label their dialog with this, so the state a request
+/// carries shows whether the banner is still on the page.
+const banner_label = "Cookie notice";
+
+/// The API key a test sets to fail the verification re-read, while the
+/// decision before it is answered as usual.
+pub const no_verify_key = "test-key-no-verify";
+
+/// The API key a test sets to answer slowly.
+pub const slow_key = "test-key-slow";
+
+fn bearer(req: *std.http.Server.Request, key: []const u8) bool {
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "authorization")) continue;
+        return std.mem.endsWith(u8, h.value, key);
+    }
+    return false;
+}
+
+fn yesTo(key: []const u8, deciding: bool, later_step: bool, banner_in_state: bool) bool {
+    // The one question the mock answers from the page: whether the banner's
+    // label is in the state it was sent.
+    if (std.mem.eql(u8, key, lp.tools.consent.wall_key)) return banner_in_state;
+    if (!deciding) return false;
+    if (std.mem.eql(u8, key, lp.tools.login.multi_step_key)) return later_step;
+    return isWall(key);
+}
+
+fn isWall(key: []const u8) bool {
+    return std.mem.eql(u8, key, lp.tools.consent.wall_key) or std.mem.eql(u8, key, lp.tools.login.wall_key) or
+        std.mem.eql(u8, key, lp.tools.login.error_key);
+}
+
+/// What a question is looking for, as a word its option's description carries.
+fn hintFor(key: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, key, lp.tools.consent.control_key)) return "accept";
+    if (std.mem.eql(u8, key, lp.tools.login.user_key)) return "user";
+    if (std.mem.eql(u8, key, lp.tools.login.password_key)) return "password";
+    if (std.mem.eql(u8, key, lp.tools.login.submit_key)) return "sign";
+    return null;
+}
+
+/// How the question under `key` would be answered, or null when nothing
+/// offered fits it.
+fn pickFor(arena: std.mem.Allocator, asked: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const question = switch (asked.get(key) orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    const options: std.json.ObjectMap = switch (question.get("criteria") orelse .null) {
+        .object => |o| o,
+        else => return null,
+    };
+    return pickOption(arena, options, hintFor(key));
+}
+
+/// The first option whose description mentions the hint — a stand-in for the
+/// model's judgment, so the test exercises the question and answer plumbing
+/// rather than a canned node id. When nothing matches, the answer is `none`:
+/// a reworded fixture then fails the test that asked rather than quietly
+/// picking something else.
+fn pickOption(arena: std.mem.Allocator, options: std.json.ObjectMap, hint: ?[]const u8) ?[]const u8 {
+    var it = options.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, lp.tools.choose.none_key) or std.mem.eql(u8, key, lp.tools.login.enter_key)) continue;
+        const wanted = hint orelse return key;
+        const described = std.json.Stringify.valueAlloc(arena, entry.value_ptr.*, .{}) catch continue;
+        if (std.ascii.findIgnoreCase(described, wanted) != null) return key;
+    }
+    return null;
 }

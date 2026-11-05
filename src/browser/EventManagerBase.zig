@@ -223,6 +223,23 @@ pub fn remove(self: *EventManagerBase, target: *EventTarget, typ: []const u8, ca
     }
 }
 
+// Live listeners across every target. Listeners removed mid-dispatch stay in
+// their list until the dispatch unwinds, flagged `removed`; they don't count.
+pub fn listenerCount(self: *const EventManagerBase) usize {
+    var count: usize = 0;
+    var it = self.lookup.valueIterator();
+    while (it.next()) |type_listeners| {
+        for (type_listeners.items) |tl| {
+            var node = tl.list.first;
+            while (node) |n| : (node = n.next) {
+                const listener: *const Listener = @alignCast(@fieldParentPtr("node", n));
+                if (!listener.removed) count += 1;
+            }
+        }
+    }
+    return count;
+}
+
 pub fn removeListener(self: *EventManagerBase, list: *std.DoublyLinkedList, listener: *Listener) void {
     // Already removed (or queued for removal). Avoids double-pushing the
     // same listener into deferred_removals — which would double-free at
@@ -337,6 +354,9 @@ pub fn dispatchDirect(
 
     event.acquireRef();
     defer _ = event.releaseRef(page);
+
+    const task_scope = ctx.attribution.enterIfUntagged(.event, event._type_string.str());
+    defer if (task_scope) |ts| ts.exit();
 
     if (comptime opts.inject_target) {
         event._target = target;
@@ -490,6 +510,43 @@ pub const Listener = struct {
         event: *Event,
         comptime context: []const u8,
     ) error{ExecutionTerminated}!void {
+        // An event caused from an isolated world (e.g. element.focus() called
+        // over CDP) must reach a main-world listener with main-world wrappers.
+        if (self.function == .handler_source) {
+            _ = self.compileHandler(local.ctx, event._current_target.?);
+        }
+        if (self.otherWorldContext(local)) |ctx| {
+            var ls: js.Local.Scope = undefined;
+            ctx.localScope(&ls);
+            defer ls.deinit();
+            return self.invoke(&ls.local, event, context);
+        }
+        return self.invoke(local, event, context);
+    }
+
+    // The context the callback was created in, when it belongs to another
+    // world than `local`.
+    fn otherWorldContext(self: *const Listener, local: *const js.Local) ?*js.Context {
+        const handle: *const js.v8.Object = switch (self.function) {
+            .value => |f| @ptrCast(local.toLocal(f).handle),
+            .object => |o| local.toLocal(o).handle,
+            .handler => |h| @ptrCast(local.toLocal(h orelse return null).handle),
+            // compiled by run() before this is called
+            .handler_source => unreachable,
+        };
+        const ctx = js.Context.fromObject(handle) orelse return null;
+        if (ctx.identity == local.ctx.identity) {
+            return null;
+        }
+        return ctx;
+    }
+
+    fn invoke(
+        self: *Listener,
+        local: *const js.Local,
+        event: *Event,
+        comptime context: []const u8,
+    ) error{ExecutionTerminated}!void {
         switch (self.function) {
             .value => |value| {
                 var try_catch: js.TryCatch = undefined;
@@ -506,10 +563,9 @@ pub const Listener = struct {
                     else => log.debug(.event, context, .{ .err = err }),
                 };
             },
-            .handler, .handler_source => {
-                const handler = self.compileHandler(local.ctx, event._current_target.?) orelse return;
-                try runHandler(local.toLocal(handler), local, event, context);
-            },
+            .handler => |h| try runHandler(local.toLocal(h orelse return), local, event, context),
+            // compiled by run() before this is called
+            .handler_source => unreachable,
             .object => |obj_global| {
                 const obj = local.toLocal(obj_global);
 
@@ -560,10 +616,15 @@ pub const Listener = struct {
         switch (self.function) {
             .handler => |h| return h,
             .handler_source => |source| {
-                // compiled on first use (then turned into a handler).
+                // compiled on first use (then turned into a handler), in the
+                // main world whichever world asks first.
                 // on error, the handler becomes null.
+                const main_ctx = switch (ctx.global) {
+                    .frame => |frame| frame.main_js,
+                    .worker => ctx,
+                };
                 var ls: js.Local.Scope = undefined;
-                ctx.localScope(&ls);
+                main_ctx.localScope(&ls);
                 defer ls.deinit();
 
                 var try_catch: js.TryCatch = undefined;
@@ -661,7 +722,7 @@ pub const Listener = struct {
 
     // Reports a listener exception to the relevant global (firing
     // window.onerror / an "error" event) without stopping the dispatch.
-    pub fn reportException(try_catch: *js.TryCatch, local: *const js.Local) void {
+    fn reportException(try_catch: *js.TryCatch, local: *const js.Local) void {
         const exc = try_catch.exceptionValue() orelse return;
         reportExceptionValue(local, exc);
     }

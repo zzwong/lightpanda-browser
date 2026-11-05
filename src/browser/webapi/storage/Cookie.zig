@@ -127,7 +127,7 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
         return error.InvalidNameValue;
     };
 
-    if (cookie_name.len == 0 and hasHiddenPrefix(cookie_value)) {
+    if (cookie_name.len == 0 and (cookie_value.len == 0 or hasHiddenPrefix(cookie_value))) {
         return error.InvalidNameValue;
     }
 
@@ -1027,10 +1027,23 @@ pub const Jar = struct {
     }
 
     pub fn populateFromResponse(self: *Jar, url: [:0]const u8, set_cookie: []const u8) !void {
+        return self.populateFromResponseInContext(url, set_cookie, true);
+    }
+
+    // `same_site` is true when the response is to a same-site request or a
+    // top-level navigation.
+    pub fn populateFromResponseInContext(self: *Jar, url: [:0]const u8, set_cookie: []const u8, same_site: bool) !void {
         const c = Cookie.parse(self.allocator, url, set_cookie) catch |err| {
             log.debug(.frame, "cookie parse failed", .{ .raw = set_cookie, .err = err });
             return;
         };
+
+        if (same_site == false and c.same_site != .none) {
+            // Cookies that aren't on the same site must have SameSite=None
+            log.debug(.frame, "cross-site cookie ignored", .{ .name = c.name, .same_site = c.same_site });
+            c.deinit();
+            return;
+        }
 
         const now = lp.datetime.timestamp(.real);
         try self.addFromUrl(url, c, now, true);
@@ -1833,6 +1846,10 @@ test "Cookie: parse key=value" {
     try expectError(error.InvalidByteSequence, null, "a\nb=c");
     try expectError(error.InvalidByteSequence, null, "a\rb=c");
     try expectError(error.InvalidByteSequence, null, &.{ 'a', '=', 'b', 0 });
+
+    // Neither a name nor a value: RFC 6265bis ignores the cookie.
+    try expectError(error.InvalidNameValue, null, "=");
+    try expectError(error.InvalidNameValue, null, " = ; Path=/");
 
     // Nameless cookies whose value begins with a prefix (case-insensitive,
     // after leading whitespace) are rejected so they can't impersonate
