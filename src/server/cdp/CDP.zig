@@ -667,6 +667,7 @@ pub const BrowserContext = struct {
         // context is always nested inside of the isolated world context,
         // so we need to shutdown the page one first.
         browser.closeSession();
+        browser.setViewportOverride(null);
 
         self.node_registry.deinit();
         self.node_search_list.deinit();
