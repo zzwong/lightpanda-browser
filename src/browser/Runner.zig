@@ -36,16 +36,19 @@ const Runner = @This();
 session: *Session,
 browser: *Browser,
 http_client: *HttpClient,
+pump_peers: bool,
 
 const network_idle_hold_ms = 500;
 
-pub const Opts = struct {};
+pub const PeerPump = struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+pub const Opts = struct { pump_peers: bool = true };
 
-pub fn init(session: *Session, _: Opts) Runner {
+pub fn init(session: *Session, opts: Opts) Runner {
     return .{
         .session = session,
         .browser = session.browser,
         .http_client = session.http_client,
+        .pump_peers = opts.pump_peers,
     };
 }
 
@@ -214,10 +217,19 @@ pub fn tick(self: *Runner, timeout_ms: u32, conditions: []WaitCondition) !TickRe
     return self._tick(false, timeout_ms, conditions);
 }
 
-fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []WaitCondition) !TickResult {
+pub fn tickCDP(self: *Runner, timeout_ms: u32) !void {
+    var conditions: [0]WaitCondition = .{};
+    _ = try self._tick(true, timeout_ms, &conditions);
+}
+
+fn _tick(self: *Runner, comptime is_cdp: bool, requested_timeout_ms: u32, conditions: []WaitCondition) !TickResult {
     const session = self.session;
     const browser = self.browser;
     const http_client = self.http_client;
+    const timeout_ms = if (self.pump_peers and session.peer_pump != null) @min(requested_timeout_ms, 5) else requested_timeout_ms;
+    if (self.pump_peers) {
+        if (session.peer_pump) |pump| try pump.run(pump.context);
+    }
     defer {
         browser.flushArenaMemory();
         browser.sampleJsHeap();
@@ -244,7 +256,7 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
     const total_http_activity = activity.http;
 
     const network_idle = activity.idle();
-    const is_done = browser.hasMacrotasks() == false and network_idle;
+    const is_done = browser.env.hasMacrotasks(session) == false and network_idle;
 
     // Not Frame._notified_network_idle: that latches for CDP's one-shot
     // lifecycle event, so a frame idle once reads idle forever.
