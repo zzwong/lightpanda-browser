@@ -538,6 +538,7 @@ pub const BrowserContext = struct {
             lp.cookies.saveToFile(&self.session.cookie_jar, cookie_jar_path);
         }
 
+        const http_client = self.session.http_client;
         browser.closeSession();
 
         self.attached_sessions.deinit(allocator);
@@ -549,14 +550,14 @@ pub const BrowserContext = struct {
         if (self.http_proxy_changed) {
             // has to be called after browser.closeSession, since it won't
             // work if there are active connections.
-            browser.http_client.changeProxy(null) catch |err| {
+            http_client.changeProxy(null) catch |err| {
                 log.warn(.http, "changeProxy", .{ .err = err });
             };
         }
         if (self.user_agent_changed) {
-            browser.http_client.clearUserAgentOverride();
+            http_client.clearUserAgentOverride();
         }
-        browser.http_client.clearAcceptLanguageOverride();
+        http_client.clearAcceptLanguageOverride();
     }
 
     // A new target, not bound to a page yet: the next page created in the
@@ -1058,6 +1059,10 @@ pub const Command = struct {
             }
         }
         return if (bc.targets.items.len > 0) bc.targets.items[0] else error.TargetNotLoaded;
+    }
+
+    pub fn httpClient(self: *const Command) *HttpClient {
+        return if (self.browser_context) |bc| bc.session.http_client else &self.cdp.browser.http_client;
     }
 
     pub fn createBrowserContext(self: *Command) !*BrowserContext {
