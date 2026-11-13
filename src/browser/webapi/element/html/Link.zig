@@ -136,10 +136,12 @@ pub fn linkAddedCallback(self: *Link, frame: *Frame) !void {
 
     const rel = element.getAttributeInterned("rel") orelse return;
 
-    // Opt-in fetch for `rel="stylesheet"` — drives `frame.loadExternalStylesheet`,
-    // which fires the load/error event itself.
-    if (std.mem.eql(u8, rel, "stylesheet")) {
-        return frame.loadExternalStylesheet(self, href);
+    // A stylesheet may also carry other rel tokens (e.g. Vite's preload).
+    var rel_tokens = std.mem.tokenizeAny(u8, rel, " \t\n\r\x0c");
+    while (rel_tokens.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(token, "stylesheet")) {
+            return frame.loadExternalStylesheet(self, href);
+        }
     }
 
     if (std.mem.eql(u8, rel, "preload")) {
@@ -232,6 +234,11 @@ test "WebApi: HTML.Link" {
 test "WebApi: HTML.Link external stylesheet" {
     testing.silenceLog(&.{.http});
     try testing.htmlRunner("css/external_stylesheet.html", .{ .load_resources = .{ .stylesheet = true } });
+}
+
+test "WebApi: HTML.Link external stylesheet rel tokens" {
+    testing.silenceLog(&.{.http});
+    try testing.htmlRunner("css/stylesheet_rel_tokens.html", .{ .load_resources = .{ .stylesheet = true } });
 }
 
 test "WebApi: HTML.Link external stylesheet charset" {

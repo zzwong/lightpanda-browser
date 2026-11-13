@@ -168,6 +168,24 @@
 }
 </script>
 
+<script id="combined-stylesheet-with-fetching-disabled">
+{
+  const link = document.createElement('link');
+  link.rel = 'preload stylesheet';
+  link.as = 'style';
+  link.href = '/styles/visibility.css';
+  let loaded = false;
+  link.addEventListener('load', () => { loaded = true; });
+  document.head.appendChild(link);
+  testing.onload(() => {
+    testing.expectTrue(loaded);
+    testing.diverges('Chrome: always fetches stylesheets', () => {
+      testing.expectFalse(Array.from(document.styleSheets).some(sheet => sheet.ownerNode === link));
+    });
+  });
+}
+</script>
+
 <script id="ext_stylesheet_disabled_default">
 {
   // Flag defaults off — a <link rel=stylesheet> must NOT register a sheet
