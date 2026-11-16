@@ -525,7 +525,7 @@ test "cdp.browser: permission setup works before the first target" {
                 try ctx.expectSentResult(.{ .browserContextId = ctx.cdp().browser_context.?.id }, .{ .id = 2 });
             }
             try ctx.processMessage(.{ .id = 3, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
-            const bc = &ctx.cdp().browser_context.?;
+            const bc = ctx.cdp().browser_context.?;
             const expected: PermissionState = switch (index) {
                 0 => .granted,
                 1 => .denied,
@@ -560,7 +560,7 @@ test "cdp.browser: resetting staged permissions leaves context creation availabl
     try testing.expectEqual(null, ctx.cdp().browser_context);
     try testing.expectEqual(0, ctx.cdp().pending_permissions.count());
     try ctx.processMessage(.{ .id = 3, .method = "Target.createBrowserContext" });
-    const bc = &ctx.cdp().browser_context.?;
+    const bc = ctx.cdp().browser_context.?;
     try ctx.expectSentResult(.{ .browserContextId = bc.id }, .{ .id = 3 });
     try testing.expectEqual(0, bc.session.permissions.count());
 }

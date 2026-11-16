@@ -36,16 +36,19 @@ const Runner = @This();
 session: *Session,
 browser: *Browser,
 http_client: *HttpClient,
+pump_peers: bool,
 
 const network_idle_hold_ms = 500;
 
-pub const Opts = struct {};
+pub const PeerPump = struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+pub const Opts = struct { pump_peers: bool = true };
 
-pub fn init(session: *Session, _: Opts) Runner {
+pub fn init(session: *Session, opts: Opts) Runner {
     return .{
         .session = session,
         .browser = session.browser,
         .http_client = session.http_client,
+        .pump_peers = opts.pump_peers,
     };
 }
 
@@ -131,6 +134,11 @@ fn _wait(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
 
     const timer: std.Io.Timestamp = .now(io, .boot);
 
+    defer if (comptime is_cdp == false) {
+        // reset it (this is never set when is_cdp == true)
+        self.http_client.setWaitDeadline(null);
+    };
+
     // Periodic V8 GC hint during long waits. V8 is otherwise only nudged on
     // session/page teardown (Session.zig, Page.zig), so a page that stays
     // alive for seconds while running heavy JS accumulates wrappers and
@@ -161,10 +169,17 @@ fn _wait(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
         }
         session.processDestroyQueues();
 
+        if (comptime is_cdp == false) {
+            const elapsed_ms: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
+            const remaining_ms = timeout_ms -| elapsed_ms;
+            self.http_client.setWaitDeadline(lp.datetime.milliTimestamp(.boot) + remaining_ms);
+        }
+
         const tick_result = self._tick(is_cdp, 200, conditions) catch |err| {
             switch (err) {
                 error.JsError => {}, // already logged (with hopefully more context)
                 error.ClientDisconnected => {}, // CDP layer already logged this
+                error.WaitDeadlineExceeded => return .timeout,
                 else => log.err(.browser, "session wait", .{ .err = err }),
             }
             return err;
@@ -214,10 +229,19 @@ pub fn tick(self: *Runner, timeout_ms: u32, conditions: []WaitCondition) !TickRe
     return self._tick(false, timeout_ms, conditions);
 }
 
-fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []WaitCondition) !TickResult {
+pub fn tickCDP(self: *Runner, timeout_ms: u32) !void {
+    var conditions: [0]WaitCondition = .{};
+    _ = try self._tick(true, timeout_ms, &conditions);
+}
+
+fn _tick(self: *Runner, comptime is_cdp: bool, requested_timeout_ms: u32, conditions: []WaitCondition) !TickResult {
     const session = self.session;
     const browser = self.browser;
     const http_client = self.http_client;
+    const timeout_ms = if (self.pump_peers and session.peer_pump != null) @min(requested_timeout_ms, 5) else requested_timeout_ms;
+    if (self.pump_peers) {
+        if (session.peer_pump) |pump| try pump.run(pump.context);
+    }
     defer {
         browser.flushArenaMemory();
         browser.sampleJsHeap();
@@ -244,7 +268,7 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
     const total_http_activity = activity.http;
 
     const network_idle = activity.idle();
-    const is_done = browser.hasMacrotasks() == false and network_idle;
+    const is_done = browser.env.hasMacrotasks(session) == false and network_idle;
 
     // Not Frame._notified_network_idle: that latches for CDP's one-shot
     // lifecycle event, so a frame idle once reads idle forever.
@@ -803,6 +827,49 @@ test "Runner: settled releases a port delivery its frame dropped" {
 
     // Dropping the scheduler finalizes the delivery without running it.
     frame.js.scheduler.reset();
+    try testing.expectEqual(0, frame.page.settle.pending);
+}
+
+test "Runner: an iframe's document request belongs to the work that inserted it" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    // From untracked work (an interval, an observer callback), the iframe's
+    // request isn't a tracked root of its own.
+    _ = try ls.local.exec(
+        \\document.appendChild(document.createElement('html'));
+        \\const a = document.createElement('iframe');
+        \\a.src = 'http://127.0.0.1:9582/src/browser/tests/runner/plain.txt?a';
+        \\document.documentElement.appendChild(a);
+    , null);
+    try testing.expectEqual(0, frame.page.settle.pending);
+
+    // From tracked work, it inherits the task and holds settled.
+    const attribution = frame.js.attribution;
+    var task_scope = attribution.enter(attribution.begin(.script, .{ .root = true }));
+    _ = try ls.local.exec(
+        \\const b = document.createElement('iframe');
+        \\b.src = 'http://127.0.0.1:9582/src/browser/tests/runner/plain.txt?b';
+        \\document.documentElement.appendChild(b);
+    , null);
+    task_scope.exit();
+    try testing.expectEqual(1, frame.page.settle.pending);
+
+    // A re-navigation from tracked work is queued: it holds settled until it
+    // runs, then its request runs under the task that queued it.
+    task_scope = attribution.enter(attribution.begin(.script, .{ .root = true }));
+    _ = try ls.local.exec("a.src = 'http://127.0.0.1:9582/src/browser/tests/runner/plain.txt?a2';", null);
+    task_scope.exit();
+    try testing.expectEqual(2, frame.page.settle.pending);
+
+    _ = try testing.test_session.processQueuedNavigation();
+    try testing.expectEqual(2, frame.page.settle.pending);
+
+    try testing.waitForFrame();
     try testing.expectEqual(0, frame.page.settle.pending);
 }
 

@@ -33,6 +33,7 @@ const URL = @import("URL.zig");
 const Page = @import("Page.zig");
 const Frame = @import("Frame.zig");
 const Browser = @import("Browser.zig");
+const Viewport = @import("Viewport.zig");
 const HttpClient = @import("../network/HttpClient.zig");
 const Geolocation = @import("webapi/geolocation/Geolocation.zig");
 const PermissionState = @import("webapi/Permissions.zig").State;
@@ -57,6 +58,8 @@ browser: *Browser,
 http_client: *HttpClient,
 permissions: PermissionOverrides = .{},
 geolocation_override: ?Geolocation.Override = null,
+viewport_override: ?Viewport = null,
+peer_pump: ?Runner.PeerPump = null,
 arena: *lp.Arena,
 // Session history, one per top-level browsing context, keyed by its root
 // frame id. Outlives the Page: a root navigation's replacement Page reuses the
@@ -189,6 +192,15 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         .experimental_features = browser.app.config.experimentalFeatures(),
     };
     errdefer self._console_messages.deinit();
+}
+
+pub fn getViewport(self: *const Session) Viewport {
+    return self.viewport_override orelse self.browser.getViewport();
+}
+
+pub fn setViewportOverride(self: *Session, viewport: ?Viewport) void {
+    self.viewport_override = viewport;
+    for (self.pages.items) |page| page.viewportChanged();
 }
 
 // The client is borrowed and must outlive the session. Install it before
@@ -815,6 +827,9 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
         if (frame._queued_navigation) |qn| {
             if (qn.is_about_something) {
                 log.debug(.frame, "recursive about blank", .{});
+                // Never processed: it must not hold settled. The frame keeps it
+                // until deinit.
+                qn.settle_hold.release();
                 _ = page.queued_navigation.swapRemove(i);
                 continue;
             }
@@ -825,7 +840,7 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
 
 fn processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) !void {
     frame._queued_navigation = null;
-    defer qn.arena.release();
+    defer qn.release();
 
     // A popup whose window was close()'d is parked in page.closed_frames and
     // torn down at Page.deinit. It must never be navigated. This navigation
@@ -835,6 +850,9 @@ fn processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) 
     if (frame.window._closed) {
         return;
     }
+
+    const task_scope = frame.js.attribution.enter(qn.task);
+    defer task_scope.exit();
 
     self._processFrameNavigation(frame, qn) catch |err| {
         log.debug(.frame, "frame navigation", .{ .url = qn.url, .err = err });
@@ -962,7 +980,7 @@ fn processRootQueuedNavigation(self: *Session, page: *Page) !void {
     // The qn arena is consumed here regardless of success — frame.navigate
     // dupes the URL into the page's own arena, so we can release the qn
     // arena as soon as navigate returns.
-    defer qn.arena.release();
+    defer qn.release();
 
     if (is_synthetic) {
         return self.replaceRootImmediate(current_frame._frame_id, qn.url, qn.opts);

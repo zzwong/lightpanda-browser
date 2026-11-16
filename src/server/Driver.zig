@@ -223,6 +223,14 @@ fn tick(self: *const Driver) !bool {
         return false;
     }
 
+    if (self.impl == .cdp) {
+        self.impl.cdp.tick() catch |err| switch (err) {
+            error.ClientDisconnected => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     // Liveness is enforced by TCP keepalive configured in
     // Server.configureSocket; the wakeup lets V8 run or terminate.
     const wait_ms: u32 = 1000; // 1s
@@ -258,7 +266,7 @@ fn pageWait(self: *const Driver) ?PageWait {
     switch (self.impl) {
         .cdp => |cdp| {
             // Any page: the runner ticks every page of the session.
-            const bc = &(cdp.browser_context orelse return null);
+            const bc = cdp.browser_context orelse return null;
             for (bc.targets.items) |target| {
                 const page = target.pageHandle() orelse continue;
                 return .{ .session = bc.session, .frame_id = page.frame_id };

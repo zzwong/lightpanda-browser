@@ -871,7 +871,7 @@ test "cdp.network setExtraHTTPHeaders" {
         .params = .{ .headers = .{ .food = "bars" } },
     });
 
-    const bc = &ctx.cdp().browser_context.?;
+    const bc = ctx.cdp().browser_context.?;
     try testing.expectEqual((try testing.firstTarget(bc)).extra_headers.items.len, 1);
 }
 
@@ -912,7 +912,7 @@ test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent" {
         .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0" } },
     });
 
-    const bc = &ctx.cdp().browser_context.?;
+    const bc = ctx.cdp().browser_context.?;
     try testing.expectEqual((try testing.firstTarget(bc)).extra_headers.items.len, 0);
 }
 
@@ -928,7 +928,7 @@ test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
         .params = .{ .headers = .{ .@"User-Agent" = "CustomBot/2.0" } },
     });
 
-    const bc = &ctx.cdp().browser_context.?;
+    const bc = ctx.cdp().browser_context.?;
     try testing.expectEqual((try testing.firstTarget(bc)).extra_headers.items.len, 1);
 }
 
@@ -949,7 +949,7 @@ test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent smuggled via 
         .params = .{ .headers = .{ .@"User-Agent:Mozilla/5.0 (X" = "Y)" } },
     });
 
-    const bc = &ctx.cdp().browser_context.?;
+    const bc = ctx.cdp().browser_context.?;
     try testing.expectEqual((try testing.firstTarget(bc)).extra_headers.items.len, 0);
 }
 
@@ -1268,10 +1268,10 @@ test "cdp.Network: canClearBrowserCache" {
 test "cdp.Network: setCacheDisabled" {
     var ctx = try testing.context();
     defer ctx.deinit();
-    _ = try ctx.loadBrowserContext(.{ .id = "BID-CD1" });
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-CD1" });
 
     var cache: Cache = undefined;
-    const client = &ctx.cdp().browser.http_client;
+    const client = bc.session.http_client;
     client.cache = &cache;
 
     try ctx.processMessage(.{
@@ -1286,10 +1286,10 @@ test "cdp.Network: setCacheDisabled" {
 test "cdp.Network: configured CDP ignores setCacheDisabled" {
     var ctx = try testing.context();
     defer ctx.deinit();
-    _ = try ctx.loadBrowserContext(.{ .id = "BID-CD2" });
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-CD2" });
 
     var cache: Cache = undefined;
-    const client = &ctx.cdp().browser.http_client;
+    const client = bc.session.http_client;
     client.cache = &cache;
     defer client.cache = &testing.base.test_app.network.cache;
 
@@ -1919,7 +1919,7 @@ test "cdp.Network: worker requests emit network events" {
 
     const cdp = ctx.cdp();
     _ = try cdp.createBrowserContext();
-    var bc = &cdp.browser_context.?;
+    var bc = cdp.browser_context.?;
     bc.id = "BID-NW";
     _ = try (try bc.createTarget()).attachPrimarySession("SID-NW");
     (try testing.firstTarget(bc)).target_id = "TID-NW-0000000".*;
